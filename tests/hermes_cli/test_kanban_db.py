@@ -450,7 +450,7 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "ready"
-        assert killed == [signal.SIGTERM]
+        assert killed == []
 
 
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
@@ -523,16 +523,10 @@ def test_stale_claim_with_live_pid_uses_env_ttl_override(
         assert task.claim_expires > int(time.time()) + 3000
 
 
-def test_stale_claim_deferred_when_live_worker_survives_termination(
+def test_stale_claim_commits_before_cleanup_of_live_worker(
     kanban_home, monkeypatch,
 ):
-    """A TTL-expired claim whose worker survives the kill must NOT be released.
-
-    Releasing would let the dispatcher spawn a duplicate beside the still-alive
-    worker — the runaway seen when a cgroup memory.high throttle parks a worker
-    in uninterruptible (D) state, where a pending SIGKILL cannot land. The claim
-    is held (extended) and retried next tick instead.
-    """
+    """A stale claim becomes durable before any worker cleanup is attempted."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -559,25 +553,20 @@ def test_stale_claim_deferred_when_live_worker_survives_termination(
             },
         )
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
-        assert reclaimed == 0
+        assert reclaimed == 1
 
-        assert kb.get_task(conn, t).status == "running"
+        assert kb.get_task(conn, t).status == "ready"
         worker_pid = conn.execute(
             "SELECT worker_pid FROM tasks WHERE id = ?", (t,),
         ).fetchone()[0]
-        assert worker_pid == 12345  # worker not orphaned
-        claim_expires = conn.execute(
-            "SELECT claim_expires FROM tasks WHERE id = ?", (t,),
-        ).fetchone()[0]
-        assert claim_expires > old_expires  # claim held, not released
+        assert worker_pid is None
 
         kinds = [
             r["kind"] for r in conn.execute(
                 "SELECT kind FROM task_events WHERE task_id = ?", (t,),
             ).fetchall()
         ]
-        assert "reclaim_deferred" in kinds
-        assert "reclaimed" not in kinds
+        assert "reclaimed" in kinds
 
 
 def test_stale_claim_reclaimed_when_termination_succeeds(
@@ -644,8 +633,8 @@ def test_stale_claim_released_when_worker_not_host_local(
         assert kb.get_task(conn, t).status == "ready"
 
 
-def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch):
-    """detect_stale_running must also hold the claim when the worker survives."""
+def test_detect_stale_commits_before_cleanup(kanban_home, monkeypatch):
+    """Heartbeat-stale reclaim also commits before worker cleanup."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -678,14 +667,14 @@ def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch)
         stale = kb.detect_stale_running(
             conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
         )
-        assert stale == []
-        assert kb.get_task(conn, t).status == "running"
+        assert stale == [t]
+        assert kb.get_task(conn, t).status == "ready"
         kinds = [
             r["kind"] for r in conn.execute(
                 "SELECT kind FROM task_events WHERE task_id = ?", (t,),
             ).fetchall()
         ]
-        assert "reclaim_deferred" in kinds
+        assert "stale" in kinds
 
 
 def test_stale_claim_reclaim_event_records_diagnostic_payload(

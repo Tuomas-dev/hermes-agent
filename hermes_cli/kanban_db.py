@@ -3816,17 +3816,10 @@ def release_stale_claims(
                 )
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
-        )
-        # Never release a claim while our own worker is still alive: that would
-        # spawn a duplicate beside it. Hold the claim and retry next tick.
-        if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
-                conn, row["id"], row["claim_lock"], now, termination,
-                reason="ttl_expired_worker_alive",
-            )
-            continue
+        # Commit the authoritative run transition before touching a process.
+        # The run row retains the spawn-time PID/PGID/start identity and the
+        # post-commit cleanup pass is the only code allowed to signal it.
+        termination: dict[str, Any] = {"cleanup_deferred": True}
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -3865,6 +3858,7 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+        cleanup_terminal_worker_groups(conn)
     return reclaimed
 
 
@@ -3896,9 +3890,7 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
+    termination: dict[str, Any] = {"cleanup_deferred": True}
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -6344,10 +6336,12 @@ def _terminate_worker_process_group(
             ):
                 return info
         elif members:
-            if leader_start_ticks is None or any(
-                started < int(leader_start_ticks) for _pid, started in members
-            ):
-                return info
+            # A numeric PGID is not an ownership token.  Once the recorded
+            # leader has gone there is no remaining kernel relationship that
+            # distinguishes its orphaned group from a later group which
+            # reused the same number.  Member start times only prove that the
+            # processes are newer; they do not prove descent.  Fail closed.
+            return info
         else:
             info["group_terminated"] = True
             return info
@@ -6405,17 +6399,20 @@ def _terminate_worker_process_group(
     return info
 
 
-def cleanup_terminal_worker_groups(conn: sqlite3.Connection) -> list[int]:
+def cleanup_terminal_worker_groups(
+    conn: sqlite3.Connection, *, killpg_fn=None
+) -> list[int]:
     """Clean process groups for committed terminal runs, exactly once."""
     rows = conn.execute(
         "SELECT id, worker_pid, worker_pgid, worker_start_ticks "
         "FROM task_runs WHERE ended_at IS NOT NULL "
-        "AND process_cleaned_at IS NULL AND worker_pgid IS NOT NULL"
+        "AND process_cleaned_at IS NULL"
     ).fetchall()
     cleaned: list[int] = []
     for row in rows:
         result = _terminate_worker_process_group(
-            row["worker_pgid"], row["worker_pid"], row["worker_start_ticks"]
+            row["worker_pgid"], row["worker_pid"], row["worker_start_ticks"],
+            killpg_fn=killpg_fn,
         )
         # Identity mismatch/no-longer-owned is a permanent fail-closed
         # decision: never revisit that PGID because it may now belong to an
@@ -6626,7 +6623,6 @@ def enforce_max_runtime(
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -6654,32 +6650,9 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
+        # Commit the timeout first. Cleanup below consumes the spawn-time
+        # process-group identity retained on the ended run.
         killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
-        )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
-
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -6720,6 +6693,7 @@ def enforce_max_runtime(
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed},
             )
+            cleanup_terminal_worker_groups(conn, killpg_fn=signal_fn)
     return timed_out
 
 
@@ -6792,19 +6766,9 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        # Terminate the worker if it's still host-local.
-        termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
-        )
-
-        # Never release a claim while our own worker is still alive: that would
-        # spawn a duplicate beside it. Hold the claim and retry next tick.
-        if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
-                conn, tid, lock, now, termination,
-                reason="heartbeat_stale_worker_alive",
-            )
-            continue
+        # Lifecycle state must become durable before process teardown.  The
+        # cleanup pass below consumes the identity persisted on task_runs.
+        termination: dict[str, Any] = {"cleanup_deferred": True}
 
         with write_txn(conn):
             cur = conn.execute(
@@ -6845,6 +6809,8 @@ def detect_stale_running(
                 conn, tid, "stale", payload, run_id=run_id,
             )
             reclaimed.append(tid)
+
+        cleanup_terminal_worker_groups(conn)
 
         # Intentionally NOT calling _record_task_failure here. Stale reclaim
         # is dispatcher-side detection of an absent heartbeat; the task is
@@ -7504,6 +7470,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return None
 
     now = int(time.time())
+
+    # A terminal transition is authoritative before teardown.  When teardown
+    # of a verified, still-live group failed, keep the task eligible for a
+    # cleanup retry but do not start a replacement beside that old group.
+    pending_cleanup = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "AND worker_pgid IS NOT NULL AND process_cleaned_at IS NULL LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if pending_cleanup:
+        return "worker_cleanup_pending"
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a

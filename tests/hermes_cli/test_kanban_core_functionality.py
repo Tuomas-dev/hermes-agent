@@ -942,7 +942,7 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home, tmp_path):
 
 def test_max_runtime_terminates_overrun_worker(kanban_home):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
-    SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
+    committed as ``timed_out`` before identity-verified cleanup is attempted."""
     killed = []
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
@@ -978,7 +978,10 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
 
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+            # This synthetic run has no persisted PGID/start identity.  A bare
+            # PID is never sufficient authority to signal a process because it
+            # may have been reused after the lifecycle snapshot was recorded.
+            assert killed == []
 
             task = kb.get_task(conn, tid)
             assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
@@ -4172,9 +4175,10 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert len(reclaim_evs) == 1
         assert reclaim_evs[0].get("manual") is True
         assert reclaim_evs[0].get("reason") == "test reason"
-        assert reclaim_evs[0].get("termination_attempted") is True
-        assert reclaim_evs[0].get("terminated") is True
-        assert killed == [signal.SIGTERM]
+        assert reclaim_evs[0].get("cleanup_deferred") is True
+        # The synthetic run predates persisted PGID/start identity, so reclaim
+        # must fail closed instead of signaling its unverified numeric PID.
+        assert killed == []
     finally:
         conn.close()
 

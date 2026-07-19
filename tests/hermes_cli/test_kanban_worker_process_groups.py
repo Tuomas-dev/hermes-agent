@@ -34,7 +34,7 @@ def test_group_cleanup_escalates_only_recorded_group(monkeypatch):
     assert all(pgid == 4101 for pgid, _sig in calls)
 
 
-def test_dead_leader_with_owned_grandchildren_is_cleaned(monkeypatch):
+def test_dead_leader_group_is_not_signalled_without_provable_identity(monkeypatch):
     calls = []
     monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
     monkeypatch.setattr(kb, "_linux_process_identity", lambda pid: None)
@@ -45,7 +45,7 @@ def test_dead_leader_with_owned_grandchildren_is_cleaned(monkeypatch):
         killpg_fn=lambda pgid, sig: calls.append((pgid, sig)),
     )
 
-    assert calls == [(4201, signal.SIGTERM), (4201, signal.SIGKILL)]
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -123,7 +123,8 @@ def test_failed_owned_group_cleanup_is_retried(tmp_path, monkeypatch):
             ]
         )
         monkeypatch.setattr(
-            kb, "_terminate_worker_process_group", lambda *args: next(results)
+            kb, "_terminate_worker_process_group",
+            lambda *args, **kwargs: next(results),
         )
 
         assert kb.cleanup_terminal_worker_groups(conn) == []
