@@ -115,22 +115,22 @@ def test_live_leader_missing_from_group_snapshot_is_never_signalled(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    "current_identity",
+    "probe_result",
     [
-        (4702, 4701, 100),  # unrelated/reused process group
-        (4701, 9999, 100),  # session mismatch
-        (4701, 4701, 999),  # process creation token mismatch
-        None,  # dead leader or unavailable/partial native metadata
+        ("present", (4702, 4701, 100)),  # unrelated/reused group
+        ("present", (4701, 9999, 100)),  # session mismatch
+        ("present", (4701, 4701, 999)),  # creation token mismatch
+        ("unknown", None),  # unavailable/partial native metadata
     ],
 )
 def test_nonlinux_unproved_identity_is_never_signalled(
-    monkeypatch, current_identity
+    monkeypatch, probe_result
 ):
     calls = []
     monkeypatch.setattr(kb.sys, "platform", "darwin")
     monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
     monkeypatch.setattr(
-        kb, "_portable_process_identity", lambda pid: current_identity
+        kb, "_portable_process_identity_probe", lambda pid: probe_result
     )
 
     result = kb._terminate_worker_process_group(
@@ -148,7 +148,8 @@ def test_nonlinux_exact_live_identity_can_complete_cleanup(monkeypatch):
     monkeypatch.setattr(kb.sys, "platform", "darwin")
     monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
     monkeypatch.setattr(
-        kb, "_portable_process_identity", lambda pid: (4711, 4711, 100)
+        kb, "_portable_process_identity_probe",
+        lambda pid: ("present", (4711, 4711, 100)),
     )
 
     def signal_group(pgid, sig):
@@ -166,11 +167,14 @@ def test_nonlinux_exact_live_identity_can_complete_cleanup(monkeypatch):
 
 def test_nonlinux_identity_is_rechecked_before_escalation(monkeypatch):
     calls = []
-    identities = iter([(4721, 4721, 100), (4721, 9999, 100)])
+    identities = iter([
+        ("present", (4721, 4721, 100)),
+        ("present", (4721, 9999, 100)),
+    ])
     monkeypatch.setattr(kb.sys, "platform", "darwin")
     monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
     monkeypatch.setattr(
-        kb, "_portable_process_identity", lambda pid: next(identities)
+        kb, "_portable_process_identity_probe", lambda pid: next(identities)
     )
 
     result = kb._terminate_worker_process_group(
@@ -179,6 +183,118 @@ def test_nonlinux_identity_is_rechecked_before_escalation(monkeypatch):
     )
 
     assert calls == [(4721, signal.SIGTERM)]
+    assert result["group_sigkill"] is False
+    assert result["group_terminated"] is False
+
+
+def test_nonlinux_successful_term_disappearance_is_verified(monkeypatch):
+    calls = []
+    probes = iter([
+        ("present", (4741, 4741, 100)),
+        ("absent", None),
+    ])
+    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
+    monkeypatch.setattr(
+        kb, "_portable_process_identity_probe", lambda pid: next(probes)
+    )
+
+    def signal_group(pgid, sig):
+        calls.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError
+
+    result = kb._terminate_worker_process_group(
+        4741, 4741, 4741, 100, grace_seconds=0.01,
+        killpg_fn=signal_group,
+    )
+
+    assert calls == [(4741, signal.SIGTERM), (4741, 0)]
+    assert result["group_terminated"] is True
+    assert result["group_sigkill"] is False
+
+
+def test_nonlinux_term_survivor_then_kill_disappearance_is_verified(monkeypatch):
+    calls = []
+    probes = iter([
+        ("present", (4751, 4751, 100)),  # initial ownership
+        ("present", (4751, 4751, 100)),  # authorize escalation
+        ("absent", None),                # post-KILL completion
+    ])
+    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
+    monkeypatch.setattr(
+        kb, "_portable_process_identity_probe", lambda pid: next(probes)
+    )
+
+    def signal_group(pgid, sig):
+        calls.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError
+
+    result = kb._terminate_worker_process_group(
+        4751, 4751, 4751, 100, grace_seconds=0,
+        killpg_fn=signal_group,
+    )
+
+    assert calls == [
+        (4751, signal.SIGTERM),
+        (4751, signal.SIGKILL),
+        (4751, 0),
+    ]
+    assert result["group_terminated"] is True
+    assert result["group_sigkill"] is True
+
+
+def test_nonlinux_already_absent_group_completes_without_signal(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
+    monkeypatch.setattr(
+        kb, "_portable_process_identity_probe", lambda pid: ("absent", None)
+    )
+
+    def signal_group(pgid, sig):
+        calls.append((pgid, sig))
+        raise ProcessLookupError
+
+    result = kb._terminate_worker_process_group(
+        4761, 4761, 4761, 100, killpg_fn=signal_group
+    )
+
+    assert calls == [(4761, 0)]
+    assert result["group_termination_attempted"] is False
+    assert result["group_terminated"] is True
+
+
+@pytest.mark.parametrize(
+    "after_term,group_probe_calls",
+    [
+        (("present", (4771, 9999, 100)), 0),  # reused identity
+        (("unknown", None), 0),               # native query failure
+        (("absent", None), 1),                # leader gone, group still visible
+    ],
+)
+def test_nonlinux_unverified_post_term_state_stays_pending(
+    monkeypatch, after_term, group_probe_calls
+):
+    calls = []
+    probes = iter([("present", (4771, 4771, 100)), after_term])
+    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
+    monkeypatch.setattr(
+        kb, "_portable_process_identity_probe", lambda pid: next(probes)
+    )
+
+    def signal_group(pgid, sig):
+        calls.append((pgid, sig))
+
+    result = kb._terminate_worker_process_group(
+        4771, 4771, 4771, 100, grace_seconds=0.01,
+        killpg_fn=signal_group,
+    )
+
+    assert calls == [(4771, signal.SIGTERM)] + [(4771, 0)] * group_probe_calls
     assert result["group_sigkill"] is False
     assert result["group_terminated"] is False
 
@@ -272,6 +388,51 @@ def test_failed_owned_group_cleanup_is_retried(tmp_path, monkeypatch):
             "SELECT process_cleaned_at FROM task_runs WHERE id=?", (run_id,)
         ).fetchone()[0] is None
         assert kb.cleanup_terminal_worker_groups(conn) == [run_id]
+    finally:
+        conn.close()
+
+
+def test_verified_portable_cleanup_stamps_once_then_releases_guard(
+    tmp_path, monkeypatch
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="portable fence", assignee="worker")
+        assert kb.claim_task(conn, task_id) is not None
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=4781, worker_pgid=4781, "
+            "worker_sid=4781, worker_start_ticks=100 WHERE id=?", (run_id,),
+        )
+        assert kb.complete_task(conn, task_id, result="ok") is True
+        monkeypatch.setattr(kb.sys, "platform", "darwin")
+        monkeypatch.setattr(kb.os, "getpgrp", lambda: 999)
+        monkeypatch.setattr(
+            kb, "_portable_process_identity_probe",
+            lambda pid: ("absent", None),
+        )
+
+        def absent_group(pgid, sig):
+            assert sig == 0
+            raise ProcessLookupError
+
+        assert kb.check_respawn_guard(conn, task_id) == "worker_cleanup_pending"
+        assert kb.cleanup_terminal_worker_groups(
+            conn, killpg_fn=absent_group
+        ) == [run_id]
+        cleaned_at = conn.execute(
+            "SELECT process_cleaned_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()[0]
+        assert cleaned_at is not None
+        assert kb.check_respawn_guard(conn, task_id) != "worker_cleanup_pending"
+        assert kb.cleanup_terminal_worker_groups(
+            conn, killpg_fn=absent_group
+        ) == []
+        assert conn.execute(
+            "SELECT process_cleaned_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()[0] == cleaned_at
     finally:
         conn.close()
 

@@ -6289,22 +6289,66 @@ def _portable_process_identity(pid: int) -> Optional[tuple[int, int, int]]:
     value survives SQLite/Python round trips without floating-point equality
     surprises.  Missing or partial native data is never an ownership proof.
     """
+    state, identity = _portable_process_identity_probe(pid)
+    return identity if state == "present" else None
+
+
+def _portable_process_identity_probe(
+    pid: int,
+) -> tuple[str, Optional[tuple[int, int, int]]]:
+    """Return ``(state, identity)`` without conflating absence and failure.
+
+    ``state`` is one of ``present``, ``absent``, or ``unknown``.  Cleanup on
+    non-Linux POSIX needs this distinction after delivering a signal: a native
+    ``NoSuchProcess`` result can help prove completion, while access failures
+    and partial metadata must keep the cleanup fence closed.
+    """
     if os.name == "nt" or sys.platform == "linux" or pid <= 0:
-        return None
+        return "unknown", None
     try:
         import psutil
     except ImportError:
-        return None
+        return "unknown", None
     try:
         proc = psutil.Process(int(pid))
         started = int(round(proc.create_time() * 1_000_000))
         pgid = os.getpgid(int(pid))
         sid = os.getsid(int(pid))
+    except (psutil.NoSuchProcess, ProcessLookupError):
+        return "absent", None
     except (psutil.Error, OSError, ValueError):
-        return None
+        return "unknown", None
     if started <= 0 or pgid <= 0 or sid <= 0:
-        return None
-    return int(pgid), int(sid), started
+        return "unknown", None
+    return "present", (int(pgid), int(sid), started)
+
+
+def _portable_owned_group_state(
+    pgid: int,
+    leader_pid: int,
+    expected_identity: tuple[int, int, int],
+    *,
+    killpg_fn=None,
+) -> str:
+    """Return ``owned``, ``absent``, ``reused``, or ``unknown``.
+
+    Absence is verified only when the native process table says the recorded
+    leader is gone *and* a signal-0 group probe says the recorded group no
+    longer exists.  No destructive signal is sent by this helper.
+    """
+    state, identity = _portable_process_identity_probe(int(leader_pid))
+    if state == "present":
+        return "owned" if identity == expected_identity else "reused"
+    if state != "absent":
+        return "unknown"
+    probe = killpg_fn if killpg_fn is not None else os.killpg
+    try:
+        probe(int(pgid), 0)
+    except ProcessLookupError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    return "unknown"
 
 
 def _linux_group_members(pgid: int) -> Optional[list[tuple[int, int, int]]]:
@@ -6440,9 +6484,17 @@ def _terminate_worker_process_group(
         # portable APIs cannot prove ownership of their orphaned descendants.
         if leader_sid is None or leader_start_ticks is None:
             return info
-        if _portable_process_identity(int(leader_pid)) != (
+        expected_portable_identity = (
             int(pgid), int(leader_sid), int(leader_start_ticks)
-        ):
+        )
+        portable_state = _portable_owned_group_state(
+            int(pgid), int(leader_pid), expected_portable_identity,
+            killpg_fn=killpg_fn,
+        )
+        if portable_state == "absent":
+            info["group_terminated"] = True
+            return info
+        if portable_state != "owned":
             return info
 
     send = killpg_fn if killpg_fn is not None else os.killpg
@@ -6466,15 +6518,26 @@ def _terminate_worker_process_group(
                 break
             if remaining is None:
                 return info
+        else:
+            portable_state = _portable_owned_group_state(
+                int(pgid), int(leader_pid), expected_portable_identity,
+                killpg_fn=killpg_fn,
+            )
+            if portable_state == "absent":
+                info["group_terminated"] = True
+                break
+            if portable_state != "owned":
+                return info
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
     if not info["group_terminated"]:
         if sys.platform == "linux" and _owned_linux_group_members(
             int(pgid), int(leader_pid), leader_sid, leader_start_ticks
         ) is None:
             return info
-        if sys.platform != "linux" and _portable_process_identity(
-            int(leader_pid)
-        ) != (int(pgid), int(leader_sid), int(leader_start_ticks)):
+        if sys.platform != "linux" and _portable_owned_group_state(
+            int(pgid), int(leader_pid), expected_portable_identity,
+            killpg_fn=killpg_fn,
+        ) != "owned":
             # The leader exited or its PID was reused after SIGTERM.  We can
             # no longer prove the numeric group belongs to this run, so never
             # escalate into a potentially unrelated group.
@@ -6500,6 +6563,19 @@ def _terminate_worker_process_group(
                     info["group_terminated"] = True
                     break
                 if remaining is None:
+                    return info
+                time.sleep(min(0.05, max(0.0, kill_deadline - time.monotonic())))
+        else:
+            kill_deadline = time.monotonic() + _WORKER_GROUP_KILL_GRACE_SECONDS
+            while time.monotonic() < kill_deadline:
+                portable_state = _portable_owned_group_state(
+                    int(pgid), int(leader_pid), expected_portable_identity,
+                    killpg_fn=killpg_fn,
+                )
+                if portable_state == "absent":
+                    info["group_terminated"] = True
+                    break
+                if portable_state != "owned":
                     return info
                 time.sleep(min(0.05, max(0.0, kill_deadline - time.monotonic())))
 
