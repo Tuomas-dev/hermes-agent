@@ -6281,6 +6281,32 @@ def _linux_process_identity(pid: int) -> Optional[tuple[int, int, int]]:
         return None
 
 
+def _portable_process_identity(pid: int) -> Optional[tuple[int, int, int]]:
+    """Return a reuse-resistant POSIX identity outside Linux procfs.
+
+    ``psutil.Process.create_time`` is backed by the native kernel process
+    table on supported platforms.  Store it as integer microseconds so the
+    value survives SQLite/Python round trips without floating-point equality
+    surprises.  Missing or partial native data is never an ownership proof.
+    """
+    if os.name == "nt" or sys.platform == "linux" or pid <= 0:
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        proc = psutil.Process(int(pid))
+        started = int(round(proc.create_time() * 1_000_000))
+        pgid = os.getpgid(int(pid))
+        sid = os.getsid(int(pid))
+    except (psutil.Error, OSError, ValueError):
+        return None
+    if started <= 0 or pgid <= 0 or sid <= 0:
+        return None
+    return int(pgid), int(sid), started
+
+
 def _linux_group_members(pgid: int) -> Optional[list[tuple[int, int, int]]]:
     """Return ``(pid, session, start_ticks)`` members, or ``None`` if unsure.
 
@@ -6408,12 +6434,15 @@ def _terminate_worker_process_group(
             # no signal result proving the numeric group is absent, so retry.
             return info
     else:
-        # On non-procfs POSIX hosts only signal while the exact leader still
-        # owns the group.  Once it exits there is no portable reuse-safe token.
-        try:
-            if os.getpgid(int(leader_pid)) != int(pgid):
-                return info
-        except (ProcessLookupError, OSError):
+        # Native process creation time supplies the non-reusable component
+        # that PID/PGID alone lack.  Require the complete spawn-time tuple;
+        # dead leaders and unavailable/partial metadata remain pending because
+        # portable APIs cannot prove ownership of their orphaned descendants.
+        if leader_sid is None or leader_start_ticks is None:
+            return info
+        if _portable_process_identity(int(leader_pid)) != (
+            int(pgid), int(leader_sid), int(leader_start_ticks)
+        ):
             return info
 
     send = killpg_fn if killpg_fn is not None else os.killpg
@@ -6443,11 +6472,18 @@ def _terminate_worker_process_group(
             int(pgid), int(leader_pid), leader_sid, leader_start_ticks
         ) is None:
             return info
+        if sys.platform != "linux" and _portable_process_identity(
+            int(leader_pid)
+        ) != (int(pgid), int(leader_sid), int(leader_start_ticks)):
+            # The leader exited or its PID was reused after SIGTERM.  We can
+            # no longer prove the numeric group belongs to this run, so never
+            # escalate into a potentially unrelated group.
+            return info
         try:
             send(int(pgid), getattr(signal, "SIGKILL", signal.SIGTERM))
             info["group_sigkill"] = True
         except ProcessLookupError:
-            pass
+            info["group_terminated"] = True
         except OSError:
             return info
         if sys.platform == "linux":
@@ -7446,14 +7482,10 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     start_ticks: Optional[int] = None
     if os.name != "nt":
         ident = _linux_process_identity(int(pid))
+        if ident is None:
+            ident = _portable_process_identity(int(pid))
         if ident is not None:
             pgid, sid, start_ticks = ident
-        else:
-            try:
-                pgid = os.getpgid(int(pid))
-                sid = os.getsid(int(pid))
-            except (ProcessLookupError, OSError):
-                pass
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
