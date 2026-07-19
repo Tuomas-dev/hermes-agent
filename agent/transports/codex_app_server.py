@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import queue
 import subprocess
 import threading
@@ -30,6 +31,95 @@ from tools.environments.local import hermes_subprocess_env
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+
+
+def _git_writable_roots(workspace: Optional[str]) -> list[str]:
+    """Return narrowly-scoped Git metadata roots for *workspace*.
+
+    Linked worktrees keep their writable index/admin files outside the working
+    tree.  Refuse metadata layouts we cannot positively identify instead of
+    turning an untrusted ``.git`` pointer into an arbitrary writable root.
+    """
+    if not workspace:
+        return []
+    try:
+        worktree = Path(workspace).resolve(strict=True)
+        if not worktree.is_dir():
+            return []
+        dotgit = worktree / ".git"
+        if dotgit.is_symlink():
+            return []
+
+        if dotgit.is_dir():
+            gitdir = dotgit.resolve(strict=True)
+            if gitdir != dotgit or not _looks_like_common_git_dir(gitdir):
+                return []
+            return [str(gitdir)]
+
+        if not dotgit.is_file():
+            return []
+        raw = dotgit.read_text(encoding="utf-8")
+        if "\x00" in raw or len(raw) > 4096:
+            return []
+        lines = raw.splitlines()
+        if len(lines) != 1 or not lines[0].startswith("gitdir: "):
+            return []
+        target = Path(lines[0][8:])
+        if not target.is_absolute():
+            target = worktree / target
+        if target.is_symlink():
+            return []
+        gitdir = target.resolve(strict=True)
+        if gitdir != Path(os.path.abspath(target)):
+            return []
+        if not gitdir.is_dir() or not _is_plain_file(gitdir / "HEAD"):
+            return []
+
+        # A real linked-worktree admin directory points back to this exact
+        # .git file.  This prevents a crafted pointer from granting writes to
+        # some unrelated repository's metadata.
+        backlink = gitdir / "gitdir"
+        if not _is_plain_file(backlink):
+            return []
+        linked_dotgit = Path(backlink.read_text(encoding="utf-8").strip())
+        if not linked_dotgit.is_absolute():
+            linked_dotgit = gitdir / linked_dotgit
+        if linked_dotgit.resolve(strict=False) != dotgit:
+            return []
+
+        commondir_file = gitdir / "commondir"
+        if not _is_plain_file(commondir_file):
+            return []
+        common = Path(commondir_file.read_text(encoding="utf-8").strip())
+        if not common.is_absolute():
+            common = gitdir / common
+        if common.is_symlink():
+            return []
+        common_lexical = Path(os.path.abspath(common))
+        common = common.resolve(strict=True)
+        if common != common_lexical:
+            return []
+        if not _looks_like_common_git_dir(common):
+            return []
+
+        roots = [str(gitdir), str(common)]
+        return list(dict.fromkeys(roots))
+    except (OSError, UnicodeError, ValueError):
+        return []
+
+
+def _is_plain_file(path: Path) -> bool:
+    return path.is_file() and not path.is_symlink()
+
+
+def _looks_like_common_git_dir(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and not path.is_symlink()
+        and _is_plain_file(path / "HEAD")
+        and (path / "objects").is_dir()
+        and not (path / "objects").is_symlink()
+    )
 
 
 @dataclass
@@ -74,6 +164,7 @@ class CodexAppServerClient:
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        workspace: Optional[str] = None,
     ) -> None:
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
@@ -112,12 +203,16 @@ class CodexAppServerClient:
                     ),
                 )
             )
+            writable_roots = [os.path.realpath(kanban_root)]
+            writable_roots.extend(_git_writable_roots(workspace))
+            writable_roots = list(dict.fromkeys(writable_roots))
             app_server_args.extend(
                 [
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
+                    "sandbox_workspace_write.writable_roots="
+                    + json.dumps(writable_roots, ensure_ascii=False),
                     "-c",
                     "sandbox_workspace_write.network_access=false",
                 ]

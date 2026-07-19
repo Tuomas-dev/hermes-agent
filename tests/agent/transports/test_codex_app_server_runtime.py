@@ -7,6 +7,8 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import tomllib
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -295,6 +297,118 @@ class TestSpawnEnvIsolation:
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+
+    def test_kanban_linked_worktree_adds_exact_git_metadata_roots(
+        self, monkeypatch, tmp_path
+    ):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        common = tmp_path / 'repo' / '.git'
+        admin = common / 'worktrees' / 'task'
+        workspace = tmp_path / 'task'
+        admin.mkdir(parents=True)
+        workspace.mkdir()
+        (common / 'objects').mkdir()
+        (common / 'HEAD').write_text('ref: refs/heads/main\n')
+        (admin / 'HEAD').write_text('ref: refs/heads/task\n')
+        (admin / 'commondir').write_text('../..\n')
+        (admin / 'gitdir').write_text(str(workspace / '.git') + '\n')
+        (workspace / '.git').write_text(f'gitdir: {admin}\n')
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured['cmd'] = list(cmd)
+                self.stdin = self.stdout = self.stderr = None
+
+        monkeypatch.setattr(subprocess, 'Popen', FakePopen)
+        monkeypatch.setenv('HERMES_KANBAN_TASK', 't_linked')
+        board = tmp_path / 'board"quoted'
+        monkeypatch.setenv('HERMES_KANBAN_DB', str(board / 'kanban.db'))
+
+        client = cas.CodexAppServerClient(workspace=str(workspace))
+        client._closed = True
+        roots_arg = next(
+            part for part in captured['cmd']
+            if part.startswith('sandbox_workspace_write.writable_roots=')
+        )
+        roots = tomllib.loads(roots_arg)['sandbox_workspace_write']['writable_roots']
+        assert roots == [str(board), str(admin), str(common)]
+        assert 'sandbox_workspace_write.network_access=false' in captured['cmd']
+
+    def test_git_writable_roots_supports_normal_repo_and_dedupes(self, tmp_path):
+        from agent.transports.codex_app_server import _git_writable_roots
+
+        repo = tmp_path / 'repo'
+        gitdir = repo / '.git'
+        (gitdir / 'objects').mkdir(parents=True)
+        (gitdir / 'HEAD').write_text('ref: refs/heads/main\n')
+
+        assert _git_writable_roots(str(repo)) == [str(gitdir)]
+        assert len(_git_writable_roots(str(repo))) == 1
+
+    def test_kanban_writable_roots_dedupe_board_and_git_root(
+        self, monkeypatch, tmp_path
+    ):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        repo = tmp_path / 'repo'
+        gitdir = repo / '.git'
+        (gitdir / 'objects').mkdir(parents=True)
+        (gitdir / 'HEAD').write_text('ref: refs/heads/main\n')
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured['cmd'] = list(cmd)
+                self.stdin = self.stdout = self.stderr = None
+
+        monkeypatch.setattr(subprocess, 'Popen', FakePopen)
+        monkeypatch.setenv('HERMES_KANBAN_TASK', 't_dedupe')
+        monkeypatch.setenv('HERMES_KANBAN_DB', str(gitdir / 'kanban.db'))
+        client = cas.CodexAppServerClient(workspace=str(repo))
+        client._closed = True
+
+        roots_arg = next(
+            part for part in captured['cmd']
+            if part.startswith('sandbox_workspace_write.writable_roots=')
+        )
+        roots = tomllib.loads(roots_arg)['sandbox_workspace_write']['writable_roots']
+        assert roots == [str(gitdir)]
+
+    def test_git_writable_roots_fails_closed_for_non_git_and_hostile_metadata(
+        self, tmp_path
+    ):
+        from agent.transports.codex_app_server import _git_writable_roots
+
+        workspace = tmp_path / 'workspace'
+        unrelated = tmp_path / 'unrelated.git'
+        workspace.mkdir()
+        (unrelated / 'objects').mkdir(parents=True)
+        (unrelated / 'HEAD').write_text('ref: refs/heads/main\n')
+        assert _git_writable_roots(str(workspace)) == []
+
+        # Merely pointing at a valid repository is insufficient: linked Git
+        # admin metadata must contain a backlink to this exact workspace.
+        (workspace / '.git').write_text(f'gitdir: {unrelated}\n')
+        assert _git_writable_roots(str(workspace)) == []
+
+        (workspace / '.git').unlink()
+        (workspace / '.git').symlink_to(unrelated, target_is_directory=True)
+        assert _git_writable_roots(str(workspace)) == []
+
+    def test_git_writable_roots_rejects_malformed_and_traversing_pointer(
+        self, tmp_path
+    ):
+        from agent.transports.codex_app_server import _git_writable_roots
+
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir()
+        (workspace / '.git').write_text('gitdir: ../outside\nextra\n')
+        assert _git_writable_roots(str(workspace)) == []
 
 
 class TestSpawnEnvSecretStripping:
