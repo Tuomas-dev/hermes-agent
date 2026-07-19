@@ -24,6 +24,7 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -47,6 +48,26 @@ logger = logging.getLogger(__name__)
 # wedge watchdog, etc.). Small enough to keep error messages legible, large
 # enough to surface a config/provider/auth diagnostic.
 _STDERR_TAIL_LINES = 12
+
+
+def _factory_accepts_workspace(factory: Callable[..., Any]) -> bool:
+    """Return whether a client factory advertises the new workspace input.
+
+    ``client_factory`` predates workspace propagation, so strict custom
+    factories may only accept ``codex_bin`` and ``codex_home``.  Inspecting
+    before the single construction call preserves that contract without
+    catching a TypeError raised from inside a factory (which could already
+    have performed side effects).
+    """
+    try:
+        parameters = inspect.signature(factory).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "workspace"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 # Permission profile mapping mirrors the docstring in PR proposal:
@@ -244,11 +265,13 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(
+            client_kwargs = dict(
                 codex_bin=self._codex_bin,
                 codex_home=self._codex_home,
-                workspace=self._cwd,
             )
+            if _factory_accepts_workspace(self._client_factory):
+                client_kwargs["workspace"] = self._cwd
+            self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",

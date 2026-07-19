@@ -139,6 +139,54 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_legacy_client_factory_does_not_receive_workspace(self):
+        client = FakeClient()
+        calls = []
+
+        def legacy_factory(*, codex_bin, codex_home):
+            calls.append((codex_bin, codex_home))
+            return client
+
+        s = CodexAppServerSession(
+            cwd="/tmp/assigned-workspace",
+            codex_bin="custom-codex",
+            codex_home="/tmp/codex-home",
+            client_factory=legacy_factory,
+        )
+
+        assert s.ensure_started() == "thread-fake-001"
+        assert calls == [("custom-codex", "/tmp/codex-home")]
+
+    def test_default_client_factory_receives_workspace(self, monkeypatch):
+        client = FakeClient()
+        received = []
+
+        def client_factory(*, codex_bin, codex_home, workspace):
+            received.append(workspace)
+            return client
+
+        monkeypatch.setattr(session_mod, "CodexAppServerClient", client_factory)
+        s = CodexAppServerSession(cwd="/tmp/assigned-workspace")
+
+        assert s.ensure_started() == "thread-fake-001"
+        assert received == ["/tmp/assigned-workspace"]
+
+    def test_factory_type_error_is_not_retried(self):
+        calls = []
+
+        def broken_factory(*, codex_bin, codex_home, workspace):
+            calls.append(workspace)
+            raise TypeError("factory failed after side effect")
+
+        s = CodexAppServerSession(
+            cwd="/tmp/assigned-workspace",
+            client_factory=broken_factory,
+        )
+
+        with pytest.raises(TypeError, match="factory failed after side effect"):
+            s.ensure_started()
+        assert calls == ["/tmp/assigned-workspace"]
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)
