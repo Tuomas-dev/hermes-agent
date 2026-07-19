@@ -1219,6 +1219,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_pgid         INTEGER,
+    worker_start_ticks  INTEGER,
+    process_cleaned_at  INTEGER,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -2039,6 +2042,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        for name, declaration in (
+            ("worker_pgid", "worker_pgid INTEGER"),
+            ("worker_start_ticks", "worker_start_ticks INTEGER"),
+            ("process_cleaned_at", "process_cleaned_at INTEGER"),
+        ):
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, declaration)
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -2137,7 +2150,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_pgid INTEGER, worker_start_ticks INTEGER,"
+        " process_cleaned_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -3269,8 +3283,7 @@ def _end_run(
                metadata      = ?,
                ended_at      = ?,
                claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
+               claim_expires = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -3921,6 +3934,7 @@ def reclaim_task(
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
+    cleanup_terminal_worker_groups(conn)
     return True
 
 
@@ -6247,6 +6261,184 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+_WORKER_GROUP_TERM_GRACE_SECONDS = 2.0
+_WORKER_GROUP_KILL_GRACE_SECONDS = 1.0
+
+
+def _linux_process_identity(pid: int) -> Optional[tuple[int, int]]:
+    """Return ``(pgrp, start_ticks)`` from procfs, or ``None``.
+
+    The start tick is the kernel's non-repeating identity for a PID during a
+    boot.  Persisting it with the run prevents a stale board row from killing
+    a newly-reused PID/process group.
+    """
+    if sys.platform != "linux" or pid <= 0:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # comm is parenthesised and may contain spaces or ')', so split after
+        # the final ')' rather than splitting the whole record.
+        fields = raw[raw.rfind(")") + 2:].split()
+        return int(fields[2]), int(fields[19])  # pgrp field 5, starttime 22
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _linux_group_members(pgid: int) -> list[tuple[int, int]]:
+    members: list[tuple[int, int]] = []
+    if sys.platform != "linux":
+        return members
+    try:
+        entries = Path("/proc").iterdir()
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        ident = _linux_process_identity(int(entry.name))
+        if ident is not None and ident[0] == pgid:
+            members.append((int(entry.name), ident[1]))
+    return members
+
+
+def _terminate_worker_process_group(
+    pgid: Optional[int],
+    leader_pid: Optional[int],
+    leader_start_ticks: Optional[int],
+    *,
+    grace_seconds: float = _WORKER_GROUP_TERM_GRACE_SECONDS,
+    killpg_fn=None,
+) -> dict[str, Any]:
+    """Boundedly terminate one verified worker-owned POSIX process group.
+
+    Verification is deliberately fail-closed.  A live leader must still have
+    the recorded start identity and PGID.  If the leader has exited, every
+    surviving member must have been born no earlier than that leader.  This
+    retains orphaned grandchildren while refusing PID/PGID reuse and can never
+    target the dispatcher's own group.
+    """
+    import signal
+
+    info: dict[str, Any] = {
+        "pgid": int(pgid) if pgid else None,
+        "group_termination_attempted": False,
+        "group_terminated": False,
+        "group_sigkill": False,
+    }
+    if os.name == "nt" or not pgid or pgid <= 0 or not leader_pid:
+        return info
+    try:
+        if int(pgid) == os.getpgrp():
+            return info
+    except OSError:
+        return info
+
+    members = _linux_group_members(int(pgid))
+    if sys.platform == "linux":
+        current_leader = _linux_process_identity(int(leader_pid))
+        if current_leader is not None:
+            if (
+                current_leader[0] != int(pgid)
+                or leader_start_ticks is None
+                or current_leader[1] != int(leader_start_ticks)
+            ):
+                return info
+        elif members:
+            if leader_start_ticks is None or any(
+                started < int(leader_start_ticks) for _pid, started in members
+            ):
+                return info
+        else:
+            info["group_terminated"] = True
+            return info
+    else:
+        # On non-procfs POSIX hosts only signal while the exact leader still
+        # owns the group.  Once it exits there is no portable reuse-safe token.
+        try:
+            if os.getpgid(int(leader_pid)) != int(pgid):
+                return info
+        except (ProcessLookupError, OSError):
+            return info
+
+    send = killpg_fn if killpg_fn is not None else os.killpg
+    info["group_termination_attempted"] = True
+    try:
+        send(int(pgid), signal.SIGTERM)
+    except ProcessLookupError:
+        info["group_terminated"] = True
+        return info
+    except OSError:
+        return info
+
+    deadline = time.monotonic() + max(0.0, float(grace_seconds))
+    while time.monotonic() < deadline:
+        if sys.platform == "linux" and not _linux_group_members(int(pgid)):
+            info["group_terminated"] = True
+            break
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    if not info["group_terminated"]:
+        try:
+            send(int(pgid), getattr(signal, "SIGKILL", signal.SIGTERM))
+            info["group_sigkill"] = True
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return info
+        if sys.platform == "linux":
+            # SIGKILL is asynchronous too.  Give the kernel a bounded window
+            # to schedule every member out before declaring cleanup failed;
+            # an immediate /proc snapshot otherwise leaves fast-exiting
+            # groups recorded as live and makes the next tick signal again.
+            kill_deadline = time.monotonic() + _WORKER_GROUP_KILL_GRACE_SECONDS
+            while time.monotonic() < kill_deadline:
+                if not _linux_group_members(int(pgid)):
+                    info["group_terminated"] = True
+                    break
+                time.sleep(min(0.05, max(0.0, kill_deadline - time.monotonic())))
+
+    # Reap the leader when it is still our child. Surviving descendants are
+    # reaped by their subreaper/init owner; waitpid never targets outsiders.
+    try:
+        os.waitpid(int(leader_pid), os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+    return info
+
+
+def cleanup_terminal_worker_groups(conn: sqlite3.Connection) -> list[int]:
+    """Clean process groups for committed terminal runs, exactly once."""
+    rows = conn.execute(
+        "SELECT id, worker_pid, worker_pgid, worker_start_ticks "
+        "FROM task_runs WHERE ended_at IS NOT NULL "
+        "AND process_cleaned_at IS NULL AND worker_pgid IS NOT NULL"
+    ).fetchall()
+    cleaned: list[int] = []
+    for row in rows:
+        result = _terminate_worker_process_group(
+            row["worker_pgid"], row["worker_pid"], row["worker_start_ticks"]
+        )
+        # Identity mismatch/no-longer-owned is a permanent fail-closed
+        # decision: never revisit that PGID because it may now belong to an
+        # unrelated process.  A signal attempt that failed to empty the exact
+        # owned group is transient, however, and must remain retryable.
+        if result.get("group_termination_attempted") and not result.get(
+            "group_terminated"
+        ):
+            continue
+        # The terminal run transaction is already authoritative. This marker
+        # is a separate idempotency transaction and never changes its outcome.
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET process_cleaned_at = ? "
+                "WHERE id = ? AND ended_at IS NOT NULL "
+                "AND process_cleaned_at IS NULL",
+                (int(time.time()), int(row["id"])),
+            )
+        if cur.rowcount == 1:
+            cleaned.append(int(row["id"]))
+    return cleaned
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -7208,6 +7400,17 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    pgid: Optional[int] = None
+    start_ticks: Optional[int] = None
+    if os.name != "nt":
+        ident = _linux_process_identity(int(pid))
+        if ident is not None:
+            pgid, start_ticks = ident
+        else:
+            try:
+                pgid = os.getpgid(int(pid))
+            except (ProcessLookupError, OSError):
+                pass
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
@@ -7216,8 +7419,9 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_pgid = ?, "
+                "worker_start_ticks = ? WHERE id = ?",
+                (int(pid), pgid, start_ticks, run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
@@ -7547,6 +7751,10 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    # A worker may have committed complete/block since the previous tick.
+    # The run row deliberately retains its process identity after tasks clears
+    # worker_pid, so orphaned tool/test descendants can still be fenced.
+    cleanup_terminal_worker_groups(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -7571,6 +7779,9 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Crash/timeout/reclaim paths above commit their authoritative run outcome
+    # first. Only then tear down the exact session recorded for that run.
+    cleanup_terminal_worker_groups(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -8394,24 +8605,43 @@ def run_daemon(
                 except (ValueError, OSError):
                     pass
 
-    while not stop_event.is_set():
+    try:
+        while not stop_event.is_set():
+            try:
+                with contextlib.closing(connect()) as conn:
+                    res = dispatch_once(
+                        conn,
+                        max_spawn=max_spawn,
+                        failure_limit=failure_limit,
+                    )
+                if on_tick is not None:
+                    try:
+                        on_tick(res)
+                    except Exception:
+                        pass
+            except Exception:
+                # Don't let any single tick kill the daemon.
+                import traceback
+                traceback.print_exc()
+            stop_event.wait(timeout=interval)
+    finally:
+        # A stopped dispatcher must not abandon its owned process sessions.
+        # Reclaim commits each run before cleanup, preserving the same ordering
+        # as every other terminal lifecycle.
         try:
             with contextlib.closing(connect()) as conn:
-                res = dispatch_once(
-                    conn,
-                    max_spawn=max_spawn,
-                    failure_limit=failure_limit,
-                )
-            if on_tick is not None:
-                try:
-                    on_tick(res)
-                except Exception:
-                    pass
+                daemon_claim = _claimer_id()
+                task_ids = [
+                    row["id"] for row in conn.execute(
+                        "SELECT id FROM tasks WHERE status = 'running' "
+                        "AND claim_lock = ?", (daemon_claim,)
+                    ).fetchall()
+                ]
+                for task_id in task_ids:
+                    reclaim_task(conn, task_id, reason="dispatcher_stop")
+                cleanup_terminal_worker_groups(conn)
         except Exception:
-            # Don't let any single tick kill the daemon.
-            import traceback
-            traceback.print_exc()
-        stop_event.wait(timeout=interval)
+            _log.exception("kanban dispatcher stop cleanup failed")
 
 
 # ---------------------------------------------------------------------------
