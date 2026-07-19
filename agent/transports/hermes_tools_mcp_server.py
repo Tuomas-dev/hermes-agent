@@ -149,6 +149,20 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
+def _dispatch_with_terminal_fence(
+    dispatch: Any, tool_name: str, args: dict[str, Any]
+) -> str:
+    """Dispatch one MCP tool and publish successful terminal handoffs."""
+    result = dispatch(tool_name, args)
+    if tool_name in {"kanban_complete", "kanban_block"}:
+        from agent.transports.kanban_terminal_fence import (
+            publish_terminal_callback,
+        )
+
+        publish_terminal_callback(tool_name, result)
+    return result
+
+
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
@@ -211,7 +225,9 @@ def _build_server() -> Any:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
-                    return handle_function_call(tool_name, args or {})
+                    return _dispatch_with_terminal_fence(
+                        handle_function_call, tool_name, args or {}
+                    )
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})

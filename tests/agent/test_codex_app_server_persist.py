@@ -33,8 +33,8 @@ from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
-def _make_turn():
-    return SimpleNamespace(
+def _make_turn(**overrides):
+    values = dict(
         interrupted=False,
         error=None,
         thread_id="thread-1",
@@ -43,6 +43,11 @@ def _make_turn():
         tool_iterations=0,
         final_text="CODEX_ASSISTANT",
         should_retire=False,
+        kanban_terminal=None,
+    )
+    values.update(overrides)
+    return SimpleNamespace(
+        **values,
     )
 
 
@@ -74,6 +79,37 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["completed"] is True
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+
+
+def test_kanban_terminal_stop_is_clean_and_skips_later_side_effects():
+    """An intentional fence is completed, persisted, and never classified as
+    a crash/protocol failure or followed by memory/review side effects."""
+    agent = _make_agent(session_db=None)
+    agent._codex_session.run_turn.return_value = _make_turn(
+        final_text="",
+        should_retire=True,
+        kanban_terminal="kanban_complete",
+        projected_messages=[
+            {"role": "tool", "tool_call_id": "terminal", "content": '{"ok":true}'},
+        ],
+    )
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="finish",
+        original_user_message="finish",
+        messages=[{"role": "user", "content": "finish"}],
+        effective_task_id="task-1",
+        should_review_memory=True,
+    )
+
+    assert result["completed"] is True
+    assert result["partial"] is False
+    assert result["error"] is None
+    assert result["agent_persisted"] is True
+    assert agent._codex_session is None
+    agent._sync_external_memory_for_turn.assert_not_called()
+    agent._spawn_background_review.assert_not_called()
 
 
 def test_codex_turn_persists_each_message_exactly_once():

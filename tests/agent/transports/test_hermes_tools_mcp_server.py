@@ -9,11 +9,14 @@ build helper assembles a server when the SDK is present.
 from __future__ import annotations
 
 import inspect
+import json
 from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
+    _dispatch_with_terminal_fence,
     _signature_from_schema,
 )
+from agent.transports.kanban_terminal_fence import KANBAN_TERMINAL_FENCE_ENV
 
 
 class TestSignatureFromSchema:
@@ -199,6 +202,55 @@ class TestModuleSurface:
                 f"{worker_tool!r} missing from codex callback — kanban "
                 "workers on codex_app_server runtime would hang"
             )
+
+
+class TestTerminalFencePublishing:
+    def test_successful_terminal_callback_publishes_authoritative_handoff(
+        self, monkeypatch, tmp_path
+    ):
+        marker = tmp_path / "terminal.json"
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv(KANBAN_TERMINAL_FENCE_ENV, str(marker))
+
+        result = _dispatch_with_terminal_fence(
+            lambda name, args: json.dumps(
+                {"ok": True, "task_id": "t_worker", "run_id": 17}
+            ),
+            "kanban_complete",
+            {"summary": "authoritative summary", "metadata": {"commit": "abc"}},
+        )
+
+        assert json.loads(result)["ok"] is True
+        assert json.loads(marker.read_text()) == {
+            "run_id": 17,
+            "status": None,
+            "task_id": "t_worker",
+            "tool": "kanban_complete",
+        }
+
+    def test_failed_terminal_callback_does_not_publish(self, monkeypatch, tmp_path):
+        marker = tmp_path / "terminal.json"
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv(KANBAN_TERMINAL_FENCE_ENV, str(marker))
+
+        result = _dispatch_with_terminal_fence(
+            lambda name, args: json.dumps({"error": "retry me"}),
+            "kanban_block",
+            {"reason": "missing input"},
+        )
+
+        assert json.loads(result)["error"] == "retry me"
+        assert not marker.exists()
+
+    def test_regular_mcp_tool_never_publishes(self, monkeypatch, tmp_path):
+        marker = tmp_path / "terminal.json"
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv(KANBAN_TERMINAL_FENCE_ENV, str(marker))
+
+        assert _dispatch_with_terminal_fence(
+            lambda name, args: "search result", "web_search", {"query": "x"}
+        ) == "search result"
+        assert not marker.exists()
 
     def test_kanban_orchestrator_tools_exposed(self):
         """Orchestrator agents need to dispatch new tasks, query the

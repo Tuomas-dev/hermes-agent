@@ -29,6 +29,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -39,6 +40,10 @@ from agent.transports.codex_app_server import (
     CodexAppServerError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
+from agent.transports.kanban_terminal_fence import (
+    KANBAN_TERMINAL_FENCE_ENV,
+    read_terminal_callback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +109,9 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+    # Successful task terminal callback observed and acknowledged by Codex.
+    # This is an intentional clean stop, not an interrupt/error classification.
+    kanban_terminal: Optional[str] = None
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -255,6 +263,17 @@ class CodexAppServerSession:
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, str] = {}
         self._closed = False
+        self._kanban_terminal_fence_path = self._make_kanban_fence_path()
+
+    def _make_kanban_fence_path(self) -> Optional[str]:
+        """Allocate a fresh marker name beside the worker's board database."""
+        if not os.environ.get("HERMES_KANBAN_TASK"):
+            return None
+        db_path = os.environ.get("HERMES_KANBAN_DB")
+        if not db_path:
+            return None
+        parent = os.path.dirname(os.path.abspath(db_path))
+        return os.path.join(parent, f".terminal-fence-{uuid.uuid4().hex}.json")
 
     # ---------- lifecycle ----------
 
@@ -269,6 +288,10 @@ class CodexAppServerSession:
                 codex_bin=self._codex_bin,
                 codex_home=self._codex_home,
             )
+            if self._kanban_terminal_fence_path:
+                client_kwargs["env"] = {
+                    KANBAN_TERMINAL_FENCE_ENV: self._kanban_terminal_fence_path
+                }
             if _factory_accepts_workspace(self._client_factory):
                 client_kwargs["workspace"] = self._cwd
             self._client = self._client_factory(**client_kwargs)
@@ -333,6 +356,13 @@ class CodexAppServerSession:
                 pass
             self._client = None
         self._thread_id = None
+        if self._kanban_terminal_fence_path:
+            try:
+                os.unlink(self._kanban_terminal_fence_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug("could not remove kanban terminal fence", exc_info=True)
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -619,6 +649,28 @@ class CodexAppServerSession:
                     result.error = (
                         result.error or "codex reported turn_aborted"
                     )
+
+            # The MCP child publishes only after the board transaction has
+            # committed.  Wait for Codex's matching mcpToolCall completion so
+            # its result is safely back across the MCP wire, then hard-stop
+            # the app-server before it can begin another side-effecting item.
+            terminal = read_terminal_callback(self._kanban_terminal_fence_path)
+            item = (note.get("params") or {}).get("item") or {}
+            if (
+                terminal
+                and method == "item/completed"
+                and item.get("type") == "mcpToolCall"
+                and item.get("server") == "hermes-tools"
+                and item.get("tool") == terminal.get("tool")
+                and terminal.get("task_id") == os.environ.get("HERMES_KANBAN_TASK")
+            ):
+                result.kanban_terminal = str(terminal["tool"])
+                result.should_retire = True
+                # Closing is the lifecycle fence. turn/interrupt alone has a
+                # race with Codex scheduling its next shell/apply_patch item.
+                self._client.close()
+                turn_complete = True
+                break
 
             if method == "turn/completed":
                 turn_complete = True

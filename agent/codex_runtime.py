@@ -791,10 +791,16 @@ def run_codex_app_server_turn(
     # rather than riding the broken process. Mirrors openclaw beta.8's
     # "retire timed-out app-server clients" fix.
     if getattr(turn, "should_retire", False):
-        logger.warning(
-            "codex app-server session retired (turn error: %s)",
-            turn.error,
-        )
+        if getattr(turn, "kanban_terminal", None):
+            logger.info(
+                "codex app-server stopped after successful %s callback",
+                turn.kanban_terminal,
+            )
+        else:
+            logger.warning(
+                "codex app-server session retired (turn error: %s)",
+                turn.error,
+            )
         try:
             agent._codex_session.close()
         except Exception:
@@ -856,7 +862,11 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if (
+        not turn.interrupted
+        and turn.error is None
+        and not getattr(turn, "kanban_terminal", None)
+    ):
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -873,6 +883,7 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and not getattr(turn, "kanban_terminal", None)
         and (should_review_memory or should_review_skills)
     ):
         try:

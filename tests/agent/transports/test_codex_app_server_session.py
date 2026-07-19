@@ -20,15 +20,17 @@ from agent.transports.codex_app_server_session import (
     _approval_choice_to_codex_decision,
     _coerce_turn_input_text,
 )
+from agent.transports.kanban_terminal_fence import publish_terminal_callback
 
 
 class FakeClient:
     """Stand-in for CodexAppServerClient that records calls and lets the test
     drive the notification / server-request streams synchronously."""
 
-    def __init__(self, *, codex_bin: str = "codex", codex_home=None) -> None:
+    def __init__(self, *, codex_bin: str = "codex", codex_home=None, env=None) -> None:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
+        self.env = env
         self.requests: list[tuple[str, dict]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
@@ -221,6 +223,96 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    @pytest.mark.parametrize("tool_name", ["kanban_complete", "kanban_block"])
+    def test_successful_terminal_callback_hard_stops_before_later_mutation(
+        self, monkeypatch, tmp_path, tool_name
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+        client = FakeClient()
+        session = make_session(client)
+        marker = session._kanban_terminal_fence_path
+        assert marker is not None
+        monkeypatch.setenv("HERMES_KANBAN_TERMINAL_FENCE", marker)
+        assert publish_terminal_callback(
+            tool_name,
+            '{"ok": true, "task_id": "t_worker", "run_id": 9}',
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "mcpToolCall", "id": "mcp1", "server": "hermes-tools",
+                "tool": tool_name, "arguments": {}, "result": {"ok": True},
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "late", "command": "touch late",
+                "cwd": str(tmp_path), "status": "completed",
+                "aggregatedOutput": "mutated", "exitCode": 0,
+            },
+            threadId="t", turnId="tu1",
+        )
+        late_file = tmp_path / "late-mutation"
+        take_notification = client.take_notification
+
+        def take_notification_with_side_effect(timeout=0.0):
+            note = take_notification(timeout)
+            item = ((note or {}).get("params") or {}).get("item") or {}
+            if item.get("id") == "late":
+                late_file.write_text("mutated")
+            return note
+
+        client.take_notification = take_notification_with_side_effect
+
+        result = session.run_turn("finish", turn_timeout=2.0)
+
+        assert result.kanban_terminal == tool_name
+        assert result.interrupted is False
+        assert result.error is None
+        assert result.should_retire is True
+        assert client._closed is True
+        assert all(
+            "touch late" not in str(message)
+            for message in result.projected_messages
+        )
+        assert len(client._notifications) == 1
+        assert not late_file.exists()
+
+    def test_no_terminal_marker_keeps_processing_regular_mcp_and_shell(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "mcpToolCall", "id": "mcp1", "server": "hermes-tools",
+                "tool": "web_search", "arguments": {"query": "x"},
+                "result": {"content": "ok"},
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "next", "command": "echo ok",
+                "cwd": "/tmp", "status": "completed",
+                "aggregatedOutput": "ok", "exitCode": 0,
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("continue", turn_timeout=2.0)
+
+        assert result.kanban_terminal is None
+        assert result.error is None
+        assert result.tool_iterations == 2
+        assert client._closed is False
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
