@@ -1220,6 +1220,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_expires       INTEGER,
     worker_pid          INTEGER,
     worker_pgid         INTEGER,
+    worker_sid          INTEGER,
     worker_start_ticks  INTEGER,
     process_cleaned_at  INTEGER,
     max_runtime_seconds INTEGER,
@@ -2047,6 +2048,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         }
         for name, declaration in (
             ("worker_pgid", "worker_pgid INTEGER"),
+            ("worker_sid", "worker_sid INTEGER"),
             ("worker_start_ticks", "worker_start_ticks INTEGER"),
             ("process_cleaned_at", "process_cleaned_at INTEGER"),
         ):
@@ -2150,7 +2152,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, worker_pgid INTEGER, worker_start_ticks INTEGER,"
+        " worker_pid INTEGER, worker_pgid INTEGER, worker_sid INTEGER,"
+        " worker_start_ticks INTEGER,"
         " process_cleaned_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
@@ -6257,8 +6260,8 @@ _WORKER_GROUP_TERM_GRACE_SECONDS = 2.0
 _WORKER_GROUP_KILL_GRACE_SECONDS = 1.0
 
 
-def _linux_process_identity(pid: int) -> Optional[tuple[int, int]]:
-    """Return ``(pgrp, start_ticks)`` from procfs, or ``None``.
+def _linux_process_identity(pid: int) -> Optional[tuple[int, int, int]]:
+    """Return ``(pgrp, session, start_ticks)`` from procfs, or ``None``.
 
     The start tick is the kernel's non-repeating identity for a PID during a
     boot.  Persisting it with the run prevents a stale board row from killing
@@ -6271,31 +6274,78 @@ def _linux_process_identity(pid: int) -> Optional[tuple[int, int]]:
         # comm is parenthesised and may contain spaces or ')', so split after
         # the final ')' rather than splitting the whole record.
         fields = raw[raw.rfind(")") + 2:].split()
-        return int(fields[2]), int(fields[19])  # pgrp field 5, starttime 22
+        # fields are relative to field 3 (state): pgrp=5, session=6,
+        # starttime=22.
+        return int(fields[2]), int(fields[3]), int(fields[19])
     except (OSError, ValueError, IndexError):
         return None
 
 
-def _linux_group_members(pgid: int) -> list[tuple[int, int]]:
-    members: list[tuple[int, int]] = []
+def _linux_group_members(pgid: int) -> Optional[list[tuple[int, int, int]]]:
+    """Return ``(pid, session, start_ticks)`` members, or ``None`` if unsure.
+
+    A vanished proc entry is a harmless enumeration race.  Any other unreadable
+    entry makes the snapshot unsuitable for an ownership decision: it could be
+    a member of the target group, so callers must fail closed.
+    """
+    members: list[tuple[int, int, int]] = []
     if sys.platform != "linux":
-        return members
+        return None
     try:
         entries = Path("/proc").iterdir()
     except OSError:
-        return members
+        return None
     for entry in entries:
         if not entry.name.isdigit():
             continue
-        ident = _linux_process_identity(int(entry.name))
-        if ident is not None and ident[0] == pgid:
-            members.append((int(entry.name), ident[1]))
+        pid = int(entry.name)
+        try:
+            raw = entry.joinpath("stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        try:
+            fields = raw[raw.rfind(")") + 2:].split()
+            member_pgid = int(fields[2])
+            member_sid = int(fields[3])
+            start_ticks = int(fields[19])
+        except (ValueError, IndexError):
+            return None
+        if member_pgid == pgid:
+            members.append((pid, member_sid, start_ticks))
+    return members
+
+
+def _owned_linux_group_members(
+    pgid: int,
+    leader_pid: int,
+    leader_sid: Optional[int],
+    leader_start_ticks: Optional[int],
+) -> Optional[list[tuple[int, int, int]]]:
+    """Return a complete, session-bounded snapshot or ``None`` if unproved."""
+    if (
+        leader_sid is None
+        or leader_start_ticks is None
+        or int(leader_pid) != int(pgid)
+        or int(leader_sid) != int(leader_pid)
+    ):
+        return None
+    members = _linux_group_members(int(pgid))
+    if members is None:
+        return None
+    if any(
+        sid != int(leader_sid) or started < int(leader_start_ticks)
+        for _pid, sid, started in members
+    ):
+        return None
     return members
 
 
 def _terminate_worker_process_group(
     pgid: Optional[int],
     leader_pid: Optional[int],
+    leader_sid: Optional[int],
     leader_start_ticks: Optional[int],
     *,
     grace_seconds: float = _WORKER_GROUP_TERM_GRACE_SECONDS,
@@ -6305,9 +6355,10 @@ def _terminate_worker_process_group(
 
     Verification is deliberately fail-closed.  A live leader must still have
     the recorded start identity and PGID.  If the leader has exited, every
-    surviving member must have been born no earlier than that leader.  This
-    retains orphaned grandchildren while refusing PID/PGID reuse and can never
-    target the dispatcher's own group.
+    surviving member must remain in the worker's recorded dedicated session.
+    A process cannot change sessions or join a process group in another
+    session, so this retains orphaned descendants without trusting a numeric
+    PGID after reuse.  Incomplete process metadata always fails closed.
     """
     import signal
 
@@ -6317,7 +6368,11 @@ def _terminate_worker_process_group(
         "group_terminated": False,
         "group_sigkill": False,
     }
-    if os.name == "nt" or not pgid or pgid <= 0 or not leader_pid:
+    if os.name == "nt" or not pgid:
+        # No POSIX group was ever recorded, so there is nothing to clean.
+        info["group_terminated"] = True
+        return info
+    if pgid <= 0 or not leader_pid:
         return info
     try:
         if int(pgid) == os.getpgrp():
@@ -6325,25 +6380,32 @@ def _terminate_worker_process_group(
     except OSError:
         return info
 
-    members = _linux_group_members(int(pgid))
     if sys.platform == "linux":
+        members = _owned_linux_group_members(
+            int(pgid), int(leader_pid), leader_sid, leader_start_ticks
+        )
+        if members is None:
+            return info
         current_leader = _linux_process_identity(int(leader_pid))
         if current_leader is not None:
             if (
                 current_leader[0] != int(pgid)
+                or current_leader[1] != int(leader_sid)
                 or leader_start_ticks is None
-                or current_leader[1] != int(leader_start_ticks)
+                or current_leader[2] != int(leader_start_ticks)
             ):
                 return info
-        elif members:
-            # A numeric PGID is not an ownership token.  Once the recorded
-            # leader has gone there is no remaining kernel relationship that
-            # distinguishes its orphaned group from a later group which
-            # reused the same number.  Member start times only prove that the
-            # processes are newer; they do not prove descent.  Fail closed.
-            return info
-        else:
-            info["group_terminated"] = True
+            if (
+                int(leader_pid), int(leader_sid), int(leader_start_ticks)
+            ) not in members:
+                # The leader identity probe and group scan disagree.  Treat
+                # that as an incomplete procfs snapshot, never as absence.
+                return info
+        if not members:
+            # With the leader already gone, an empty first snapshot cannot
+            # distinguish a genuinely empty group from partial procfs
+            # visibility.  There is no owned member to authorize a signal and
+            # no signal result proving the numeric group is absent, so retry.
             return info
     else:
         # On non-procfs POSIX hosts only signal while the exact leader still
@@ -6366,11 +6428,21 @@ def _terminate_worker_process_group(
 
     deadline = time.monotonic() + max(0.0, float(grace_seconds))
     while time.monotonic() < deadline:
-        if sys.platform == "linux" and not _linux_group_members(int(pgid)):
-            info["group_terminated"] = True
-            break
+        if sys.platform == "linux":
+            remaining = _owned_linux_group_members(
+                int(pgid), int(leader_pid), leader_sid, leader_start_ticks
+            )
+            if remaining == []:
+                info["group_terminated"] = True
+                break
+            if remaining is None:
+                return info
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
     if not info["group_terminated"]:
+        if sys.platform == "linux" and _owned_linux_group_members(
+            int(pgid), int(leader_pid), leader_sid, leader_start_ticks
+        ) is None:
+            return info
         try:
             send(int(pgid), getattr(signal, "SIGKILL", signal.SIGTERM))
             info["group_sigkill"] = True
@@ -6385,9 +6457,14 @@ def _terminate_worker_process_group(
             # groups recorded as live and makes the next tick signal again.
             kill_deadline = time.monotonic() + _WORKER_GROUP_KILL_GRACE_SECONDS
             while time.monotonic() < kill_deadline:
-                if not _linux_group_members(int(pgid)):
+                remaining = _owned_linux_group_members(
+                    int(pgid), int(leader_pid), leader_sid, leader_start_ticks
+                )
+                if remaining == []:
                     info["group_terminated"] = True
                     break
+                if remaining is None:
+                    return info
                 time.sleep(min(0.05, max(0.0, kill_deadline - time.monotonic())))
 
     # Reap the leader when it is still our child. Surviving descendants are
@@ -6404,23 +6481,21 @@ def cleanup_terminal_worker_groups(
 ) -> list[int]:
     """Clean process groups for committed terminal runs, exactly once."""
     rows = conn.execute(
-        "SELECT id, worker_pid, worker_pgid, worker_start_ticks "
+        "SELECT id, worker_pid, worker_pgid, worker_sid, worker_start_ticks "
         "FROM task_runs WHERE ended_at IS NOT NULL "
         "AND process_cleaned_at IS NULL"
     ).fetchall()
     cleaned: list[int] = []
     for row in rows:
         result = _terminate_worker_process_group(
-            row["worker_pgid"], row["worker_pid"], row["worker_start_ticks"],
+            row["worker_pgid"], row["worker_pid"], row["worker_sid"],
+            row["worker_start_ticks"],
             killpg_fn=killpg_fn,
         )
-        # Identity mismatch/no-longer-owned is a permanent fail-closed
-        # decision: never revisit that PGID because it may now belong to an
-        # unrelated process.  A signal attempt that failed to empty the exact
-        # owned group is transient, however, and must remain retryable.
-        if result.get("group_termination_attempted") and not result.get(
-            "group_terminated"
-        ):
+        # Unknown ownership, an incomplete snapshot, or a group that survived
+        # signalling all remain pending.  Only verified absence/cleanup may
+        # release the respawn fence.
+        if not result.get("group_terminated"):
             continue
         # The terminal run transaction is already authoritative. This marker
         # is a separate idempotency transaction and never changes its outcome.
@@ -7367,14 +7442,16 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     the drawer.
     """
     pgid: Optional[int] = None
+    sid: Optional[int] = None
     start_ticks: Optional[int] = None
     if os.name != "nt":
         ident = _linux_process_identity(int(pid))
         if ident is not None:
-            pgid, start_ticks = ident
+            pgid, sid, start_ticks = ident
         else:
             try:
                 pgid = os.getpgid(int(pid))
+                sid = os.getsid(int(pid))
             except (ProcessLookupError, OSError):
                 pass
     with write_txn(conn):
@@ -7386,8 +7463,8 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET worker_pid = ?, worker_pgid = ?, "
-                "worker_start_ticks = ? WHERE id = ?",
-                (int(pid), pgid, start_ticks, run_id),
+                "worker_sid = ?, worker_start_ticks = ? WHERE id = ?",
+                (int(pid), pgid, sid, start_ticks, run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
