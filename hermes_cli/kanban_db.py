@@ -6257,6 +6257,12 @@ def _pid_alive(pid: Optional[int]) -> bool:
 
 
 _WORKER_GROUP_TERM_GRACE_SECONDS = 2.0
+# How long a terminal run's process group must have been continuously absent
+# before an empty /proc snapshot is accepted as proof it is gone. Guards the
+# "empty first snapshot" race the group scan cannot rule out on its own, while
+# still guaranteeing the respawn fence eventually clears — see
+# ``_terminate_worker_process_group``.
+_WORKER_GROUP_ABSENCE_GRACE_SECONDS = 60.0
 _WORKER_GROUP_KILL_GRACE_SECONDS = 1.0
 
 
@@ -6419,6 +6425,7 @@ def _terminate_worker_process_group(
     leader_start_ticks: Optional[int],
     *,
     grace_seconds: float = _WORKER_GROUP_TERM_GRACE_SECONDS,
+    ended_at: Optional[int] = None,
     killpg_fn=None,
 ) -> dict[str, Any]:
     """Boundedly terminate one verified worker-owned POSIX process group.
@@ -6472,10 +6479,31 @@ def _terminate_worker_process_group(
                 # that as an incomplete procfs snapshot, never as absence.
                 return info
         if not members:
-            # With the leader already gone, an empty first snapshot cannot
-            # distinguish a genuinely empty group from partial procfs
-            # visibility.  There is no owned member to authorize a signal and
-            # no signal result proving the numeric group is absent, so retry.
+            # An empty first snapshot cannot distinguish a genuinely empty
+            # group from partial procfs visibility, so this retries rather
+            # than resolving immediately.
+            #
+            # But retrying alone never terminates: the pgid cannot reappear,
+            # so every later sweep sees the same empty snapshot. Meanwhile
+            # ``check_respawn_guard`` fences the task for as long as the run
+            # has a pgid and no ``process_cleaned_at`` — which is how a
+            # normally-exiting worker fenced its task permanently and the
+            # dispatcher reported "ready queue non-empty but 0 workers
+            # spawned" indefinitely.
+            #
+            # Once the run has been terminal for longer than the absence
+            # grace, a dead leader plus a complete empty scan is proof enough:
+            # ``_owned_linux_group_members`` yields None for any unreadable or
+            # unparseable /proc entry (it skips only vanished-pid races), so an
+            # empty list means nothing owned by this worker is left. The
+            # portable branch below already treats ``absent`` as terminated.
+            if (
+                current_leader is None
+                and ended_at is not None
+                and time.time() - float(ended_at)
+                >= _WORKER_GROUP_ABSENCE_GRACE_SECONDS
+            ):
+                info["group_terminated"] = True
             return info
     else:
         # Native process creation time supplies the non-reusable component
@@ -6593,8 +6621,8 @@ def cleanup_terminal_worker_groups(
 ) -> list[int]:
     """Clean process groups for committed terminal runs, exactly once."""
     rows = conn.execute(
-        "SELECT id, worker_pid, worker_pgid, worker_sid, worker_start_ticks "
-        "FROM task_runs WHERE ended_at IS NOT NULL "
+        "SELECT id, worker_pid, worker_pgid, worker_sid, worker_start_ticks, "
+        "ended_at FROM task_runs WHERE ended_at IS NOT NULL "
         "AND process_cleaned_at IS NULL"
     ).fetchall()
     cleaned: list[int] = []
@@ -6602,6 +6630,7 @@ def cleanup_terminal_worker_groups(
         result = _terminate_worker_process_group(
             row["worker_pgid"], row["worker_pid"], row["worker_sid"],
             row["worker_start_ticks"],
+            ended_at=row["ended_at"],
             killpg_fn=killpg_fn,
         )
         # Unknown ownership, an incomplete snapshot, or a group that survived
