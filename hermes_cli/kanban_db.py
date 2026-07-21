@@ -3861,7 +3861,10 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
-        cleanup_terminal_worker_groups(conn)
+        # Forward the injected signal sender. Without this, ``signal_fn`` is
+        # accepted and silently ignored: a caller that thinks it has stubbed
+        # out signalling still reaches the real ``os.killpg`` inside cleanup.
+        cleanup_terminal_worker_groups(conn, killpg_fn=signal_fn)
     return reclaimed
 
 
@@ -3929,7 +3932,10 @@ def reclaim_task(
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
-    cleanup_terminal_worker_groups(conn)
+    # Forward the injected signal sender — see release_stale_claims. Worker
+    # teardown moved to process-group cleanup, but ``signal_fn`` was left
+    # unwired, so injection silently fell through to the real ``os.killpg``.
+    cleanup_terminal_worker_groups(conn, killpg_fn=signal_fn)
     return True
 
 
