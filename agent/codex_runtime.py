@@ -714,6 +714,77 @@ def run_codex_app_server_turn(
             "error": str(exc),
         }
 
+    # ── Kanban worker terminal-tool stop guard ─────────────────────────
+    # Workers must end with kanban_complete / kanban_block. Models often
+    # narrate the finish ("Implemented task X. Key changes: ...") and stop
+    # cleanly instead, which the dispatcher records as a protocol violation
+    # (rc=0 with the task still `running`) and retries until the budget is
+    # gone — even though the work itself succeeded.
+    #
+    # conversation_loop.py runs this same guard, but it lives *inside* the
+    # tool-calling while-loop that this runtime bypasses via the early
+    # return in run_conversation(). So codex-profile workers had no guard
+    # at all. Re-run the turn with the shared synthetic nudge instead.
+    #
+    # Only fires on a clean narrated stop: an errored, interrupted, or
+    # retiring turn is left exactly as before (the session may be dead, and
+    # re-running it would ride a broken process).
+    _kanban_nudges = 0
+    while not (
+        getattr(turn, "kanban_terminal", None)
+        or turn.error
+        or getattr(turn, "interrupted", False)
+        or getattr(turn, "should_retire", False)
+    ):
+        try:
+            from agent.kanban_stop import build_kanban_stop_nudge
+
+            _nudge = build_kanban_stop_nudge(
+                messages=[*messages, *(turn.projected_messages or [])],
+                attempts=_kanban_nudges,
+            )
+        except Exception:
+            logger.debug("kanban stop-loop check failed", exc_info=True)
+            break
+        if not _nudge:
+            break
+
+        _kanban_nudges += 1
+        logger.info(
+            "kanban stop-loop nudge issued (attempt %d) task=%s runtime=codex",
+            _kanban_nudges,
+            os.environ.get("HERMES_KANBAN_TASK", ""),
+        )
+        try:
+            agent._emit_status(
+                "⚠️ Kanban worker tried to exit without "
+                "kanban_complete/kanban_block — nudging to finish"
+            )
+        except Exception:
+            logger.debug("kanban nudge status emit failed", exc_info=True)
+
+        try:
+            _follow_up = agent._codex_session.run_turn(user_input=_nudge)
+        except Exception:
+            logger.exception("codex app-server kanban nudge turn failed")
+            break
+
+        # Keep the transcript faithful: the synthetic prompt is spliced in
+        # between the two turns' projected messages, mirroring how the
+        # default loop records it (marked so curator/compression can tell
+        # it apart from a real user turn).
+        _carried = [
+            *(turn.projected_messages or []),
+            {
+                "role": "user",
+                "content": _nudge,
+                "_kanban_stop_synthetic": True,
+            },
+            *(_follow_up.projected_messages or []),
+        ]
+        turn = _follow_up
+        turn.projected_messages = _carried
+
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
