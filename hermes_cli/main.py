@@ -8835,6 +8835,57 @@ def _resolve_update_branch(args) -> str:
     return (getattr(args, "branch", None) or "main").strip() or "main"
 
 
+def _classify_git_branch_relation(
+    git_cmd: list[str], cwd: Path, local_ref: str, remote_ref: str
+) -> tuple[str, int, int]:
+    """Return (relation, ahead, behind) for two refs without mutating either.
+
+    ``relation`` is one of ``equal``, ``behind``, ``ahead``, or ``diverged``.
+    Using one symmetric-difference query avoids the dangerous historical
+    shortcut where "zero commits behind" was treated as "up to date" even
+    when local-only commits existed.
+    """
+    result = subprocess.run(
+        git_cmd
+        + ["rev-list", "--left-right", "--count", f"{local_ref}...{remote_ref}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()
+        raise RuntimeError(detail[0] if detail else "could not compare Git history")
+    try:
+        ahead, behind = (int(value) for value in result.stdout.split())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Git returned an invalid branch comparison") from exc
+
+    if ahead and behind:
+        relation = "diverged"
+    elif ahead:
+        relation = "ahead"
+    elif behind:
+        relation = "behind"
+    else:
+        relation = "equal"
+    return relation, ahead, behind
+
+
+def _print_local_history_update_refusal(
+    branch: str, relation: str, ahead: int, behind: int
+) -> None:
+    """Explain a fail-closed update without prescribing destructive recovery."""
+    if relation == "ahead":
+        print(f"✗ Update stopped: local '{branch}' is {ahead} commit(s) ahead of origin/{branch}.")
+    else:
+        print(
+            f"✗ Update stopped: local '{branch}' and origin/{branch} have diverged "
+            f"({ahead} local, {behind} remote commit(s))."
+        )
+    print("  No commits or files were changed.")
+    print(f"  Integrate or preserve the local commits, then retry: git log --oneline --left-right {branch}...origin/{branch}")
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -8894,26 +8945,10 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # Note: upstream/<branch> may not exist for non-main branches (a fork's
     # bb/gui has no upstream counterpart), so when the caller picks a
     # non-default branch we skip the upstream probe and use origin directly.
-    # Installer checkouts are shallow (`git clone --depth 1`). A plain
-    # `git fetch` would unshallow the repo (dragging in the whole history —
-    # the exact cost the shallow clone avoided) and the rev-list count below
-    # would then report a huge bogus "behind" number. Detect shallow up front:
-    # fetch with --depth 1 to preserve the boundary and report presence-only.
-    is_shallow = (
-        subprocess.run(
-            git_cmd + ["rev-parse", "--is-shallow-repository"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        == "true"
-    )
-    depth_args = ["--depth", "1"] if is_shallow else []
-
     if branch == "main":
         print("→ Fetching from upstream...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["upstream", branch],
+            git_cmd + ["fetch", "upstream", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -8922,7 +8957,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             # Fallback to origin if upstream doesn't exist
             print("→ Fetching from origin...")
             fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["origin", branch],
+                git_cmd + ["fetch", "origin", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -8936,7 +8971,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # Non-default branch: compare against origin/<branch> directly.
         print("→ Fetching from origin...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
+            git_cmd + ["fetch", "origin", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -8970,43 +9005,32 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
         sys.exit(1)
 
-    if is_shallow:
-        # No history to count across the shallow boundary. Compare tip SHAs and
-        # report presence-only (mirrors the banner's _check_via_local_git).
-        head_sha = subprocess.run(
-            git_cmd + ["rev-parse", "HEAD"],
-            cwd=PROJECT_ROOT, capture_output=True, text=True,
-        ).stdout.strip()
-        target_sha = subprocess.run(
-            git_cmd + ["rev-parse", compare_branch],
-            cwd=PROJECT_ROOT, capture_output=True, text=True,
-        ).stdout.strip()
-        if head_sha and target_sha and head_sha == target_sha:
-            print("✓ Already up to date.")
-        else:
-            print(f"⚕ Update available (behind {compare_branch}).")
-            from hermes_cli.config import recommended_update_command
+    try:
+        relation, ahead, behind = _classify_git_branch_relation(
+            git_cmd, PROJECT_ROOT, "HEAD", compare_branch
+        )
+    except RuntimeError as exc:
+        print(f"✗ Could not compare local history with {compare_branch}: {exc}")
+        sys.exit(1)
 
-            print(f"  Run '{recommended_update_command()}' to install.")
-        return
-
-    rev_result = subprocess.run(
-        git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    behind = int(rev_result.stdout.strip())
-
-    if behind == 0:
+    if relation == "equal":
         print("✓ Already up to date.")
-    else:
+    elif relation == "behind":
         commits_word = "commit" if behind == 1 else "commits"
         print(f"⚕ Update available: {behind} {commits_word} behind {compare_branch}.")
         from hermes_cli.config import recommended_update_command
 
         print(f"  Run '{recommended_update_command()}' to install.")
+    elif relation == "ahead":
+        commits_word = "commit" if ahead == 1 else "commits"
+        print(f"⚠ Local checkout is {ahead} {commits_word} ahead of {compare_branch}.")
+        print("  No update was performed; local commits are preserved.")
+    else:
+        print(
+            f"⚠ Local checkout has diverged from {compare_branch} "
+            f"({ahead} local, {behind} remote commit(s))."
+        )
+        print("  Integrate the histories before running an update.")
 
 
 def _ensure_fhs_path_guard() -> None:
@@ -10044,15 +10068,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Discard npm lockfile churn before any stash/branch logic. npm rewrites
+    # npm lockfile churn is discarded after the fetched history has been
+    # classified as safe to update. npm rewrites
     # tracked package-lock.json files non-deterministically at install/build
     # time (platform-specific optional deps, ideallyInert annotations, etc.),
     # which is never an intentional edit on a managed install but leaves the
     # tree dirty — forcing an autostash on every update and making branch
-    # switches fragile. Restoring them first lets the common case (only
+    # switches fragile. Restoring them then lets the common case (only
     # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, PROJECT_ROOT)
-
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
@@ -10103,6 +10126,37 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
+
+        # Classify committed history before checkout, autostash, dependency
+        # work, or any other source mutation. A managed checkout may contain
+        # intentional production fixes; an update must never erase them just
+        # because an ff-only pull cannot reconcile the histories.
+        local_branch_ref = f"refs/heads/{branch}"
+        local_branch_exists = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", "--quiet", local_branch_ref],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        ).returncode == 0
+        if local_branch_exists:
+            try:
+                relation, ahead_count, behind_count = _classify_git_branch_relation(
+                    git_cmd, PROJECT_ROOT, local_branch_ref, f"origin/{branch}"
+                )
+            except RuntimeError as exc:
+                print(f"✗ Could not compare local '{branch}' with origin/{branch}: {exc}")
+                sys.exit(1)
+            if relation in {"ahead", "diverged"}:
+                _print_local_history_update_refusal(
+                    branch, relation, ahead_count, behind_count
+                )
+                sys.exit(1)
+        else:
+            # A target branch that has never been checked out locally is safe
+            # to create from the freshly fetched remote ref.
+            relation, ahead_count, behind_count = "behind", 0, 1
+
+        _discard_lockfile_churn(git_cmd, PROJECT_ROOT)
 
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
@@ -10169,15 +10223,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
+        # The relation was computed before any source mutation. After switching
+        # to the target branch it remains the authoritative update decision.
+        commit_count = behind_count
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -10275,26 +10323,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True,
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
-                    sys.exit(1)
+                print("✗ Fast-forward failed; the checkout was not reset.")
+                if pull_result.stderr.strip():
+                    print(f"  {pull_result.stderr.strip().splitlines()[0]}")
+                print("  Local commits are preserved. Fetch and inspect the branch histories, then retry.")
+                sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

@@ -1467,6 +1467,33 @@ function Install-Repository {
                 # users hit on update. Pin autocrlf=false so the dirt is never
                 # created in the first place.
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
+
+                # Fetch and classify committed history before autostash,
+                # checkout, or source mutation. Never erase local-only commits
+                # merely because this is a managed checkout.
+                git -c windows.appendAtomically=false fetch origin $Branch
+                if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
+                $aheadCount = 0
+                $behindCount = 1
+                git -c windows.appendAtomically=false show-ref --verify --quiet "refs/heads/$Branch"
+                if ($LASTEXITCODE -eq 0) {
+                    $relationCounts = git -c windows.appendAtomically=false rev-list --left-right --count "$Branch...origin/$Branch"
+                    if ($LASTEXITCODE -ne 0) { throw "could not compare $Branch with origin/$Branch" }
+                    $relationParts = ($relationCounts -join " ").Trim() -split '\s+'
+                    $aheadCount = [int]$relationParts[0]
+                    $behindCount = [int]$relationParts[1]
+                    if ($aheadCount -gt 0) {
+                        if ($behindCount -gt 0) {
+                            Write-Err "Update stopped: local $Branch and origin/$Branch have diverged ($aheadCount local, $behindCount remote commits)."
+                        } else {
+                            Write-Err "Update stopped: local $Branch is $aheadCount commit(s) ahead of origin/$Branch."
+                        }
+                        Write-Info "No commits or files were changed. Integrate or preserve the local commits, then retry."
+                        Write-Info "Inspect with: git log --oneline --left-right $Branch...origin/$Branch"
+                        throw "refusing to discard local Git history"
+                    }
+                }
+
                 Discard-LockfileChurn $InstallDir
                 # Preserve any real local changes before the checkout instead of
                 # discarding them with `reset --hard HEAD`. The old hard reset
@@ -1496,8 +1523,6 @@ function Install-Repository {
                     git -c windows.appendAtomically=false stash push --include-untracked -m "$stashName"
                     if ($LASTEXITCODE -eq 0) { $autostashRef = "stash@{0}" }
                 }
-                git -c windows.appendAtomically=false fetch origin $Branch
-                if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
                 # Precedence: Commit > Tag > Branch.  Commit and Tag check
                 # out as detached HEAD intentionally -- they're meant to be
                 # reproducible pins, not branches the user pulls into.
@@ -1514,15 +1539,11 @@ function Install-Repository {
                 } else {
                     git -c windows.appendAtomically=false checkout $Branch
                     if ($LASTEXITCODE -ne 0) { throw "git checkout $Branch failed (exit $LASTEXITCODE)" }
-                    # Managed installs should follow origin/$Branch exactly. If
-                    # the checkout has diverged (or has local-only commits),
-                    # ff-only pull cannot succeed -- mirror ``hermes update`` and
-                    # reset to the fetched remote so bootstrap/install can recover.
-                    git -c windows.appendAtomically=false pull --ff-only origin $Branch
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
-                        git -c windows.appendAtomically=false reset --hard "origin/$Branch"
-                        if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
+                    if ($behindCount -gt 0) {
+                        git -c windows.appendAtomically=false pull --ff-only origin $Branch
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "Fast-forward failed; the checkout was not reset and local commits are preserved."
+                        }
                     }
                 }
 

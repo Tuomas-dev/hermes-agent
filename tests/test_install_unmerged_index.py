@@ -44,7 +44,7 @@ def _extract_autostash_block() -> str:
     """Pull the autostash if-block from install.sh's update_repo()."""
     text = INSTALL_SH.read_text()
     m = re.search(
-        r'local autostash_ref="".*?\n            fi\n',
+        r'discard_update_lockfile_churn "\$INSTALL_DIR".*?\n            fi\n',
         text,
         re.DOTALL,
     )

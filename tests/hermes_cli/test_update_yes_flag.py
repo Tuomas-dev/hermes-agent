@@ -31,7 +31,7 @@ def _make_run_side_effect(
             )
         if "rev-list" in joined:
             return subprocess.CompletedProcess(
-                cmd, 0, stdout=f"{commit_count}\n", stderr=""
+                cmd, 0, stdout=f"0\t{commit_count}\n", stderr=""
             )
         # `git status --porcelain` for dirty-tree detection during autostash.
         if "status" in joined and "--porcelain" in joined:
@@ -134,4 +134,3 @@ class TestUpdateYesConfigMigration:
 
 class TestUpdateYesStashRestore:
     """--yes auto-restores the pre-update autostash without prompting."""
-

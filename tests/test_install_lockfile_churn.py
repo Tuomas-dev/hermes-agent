@@ -49,7 +49,7 @@ def _extract_install_sh_function(name: str) -> str:
 def _extract_install_sh_autostash_block() -> str:
     text = INSTALL_SH.read_text()
     match = re.search(
-        r'local autostash_ref="".*?\n            fi\n',
+        r'discard_update_lockfile_churn "\$INSTALL_DIR".*?\n            fi\n',
         text,
         re.DOTALL,
     )

@@ -1193,6 +1193,32 @@ clone_repo() {
             cd "$INSTALL_DIR"
 
             local autostash_ref=""
+
+            # Fetch and classify committed history before stashing, checking
+            # out, or changing source files. Local-only commits in a managed
+            # checkout may be intentional production fixes and must never be
+            # discarded by an installer update.
+            git remote set-branches origin "$BRANCH" 2>/dev/null || true
+            git fetch origin "$BRANCH"
+            local relation_counts ahead_count behind_count
+            ahead_count=0
+            behind_count=1
+            if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+                relation_counts="$(git rev-list --left-right --count "$BRANCH...origin/$BRANCH")"
+                ahead_count="${relation_counts%%[[:space:]]*}"
+                behind_count="${relation_counts##*[[:space:]]}"
+                if [ "$ahead_count" -gt 0 ]; then
+                    if [ "$behind_count" -gt 0 ]; then
+                        log_error "Update stopped: local $BRANCH and origin/$BRANCH have diverged ($ahead_count local, $behind_count remote commits)."
+                    else
+                        log_error "Update stopped: local $BRANCH is $ahead_count commit(s) ahead of origin/$BRANCH."
+                    fi
+                    log_info "No commits or files were changed. Integrate or preserve the local commits, then retry."
+                    log_info "Inspect with: git log --oneline --left-right $BRANCH...origin/$BRANCH"
+                    exit 1
+                fi
+            fi
+
             discard_update_lockfile_churn "$INSTALL_DIR"
             if [ -n "$(git status --porcelain)" ]; then
                 # A previously interrupted update can leave the index with
@@ -1215,20 +1241,13 @@ clone_repo() {
                 autostash_ref="stash@{0}"
             fi
 
-            # Fetch only the target branch. A bare `git fetch origin` pulls
-            # every ref, and this repo carries thousands of auto-generated
-            # branches — on a non-single-branch checkout that turns each update
-            # into a multi-minute download that can stall the installer.
-            git remote set-branches origin "$BRANCH" 2>/dev/null || true
-            git fetch origin "$BRANCH"
             git checkout "$BRANCH"
-            # Managed installs should follow origin/$BRANCH exactly. If the
-            # checkout has diverged (or has local-only commits), ff-only pull
-            # cannot succeed — mirror ``hermes update`` and reset to the
-            # fetched remote so bootstrap/install can recover.
-            if ! git pull --ff-only origin "$BRANCH"; then
-                log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
-                git reset --hard "origin/$BRANCH"
+            if [ "$behind_count" -gt 0 ]; then
+                if ! git pull --ff-only origin "$BRANCH"; then
+                    log_error "Fast-forward failed; the checkout was not reset. Local commits are preserved."
+                    log_info "Fetch and inspect $BRANCH...origin/$BRANCH, then retry."
+                    exit 1
+                fi
             fi
 
             if [ -n "$autostash_ref" ]; then

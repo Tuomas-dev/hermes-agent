@@ -411,8 +411,8 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
-            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if "rev-list" in cmd:
+            return SimpleNamespace(stdout="0\t1\n", stderr="", returncode=0)
         if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[all]"]:
@@ -460,8 +460,8 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
-            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if "rev-list" in cmd:
+            return SimpleNamespace(stdout="0\t1\n", stderr="", returncode=0)
         if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -529,6 +529,7 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 
 def _make_update_side_effect(
     current_branch="main",
+    ahead_count="0",
     commit_count="3",
     ff_only_fails=False,
     reset_fails=False,
@@ -550,7 +551,9 @@ def _make_update_side_effect(
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
-            return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
+            return SimpleNamespace(
+                stdout=f"{ahead_count}\t{commit_count}\n", stderr="", returncode=0
+            )
         if "--ff-only" in joined:
             if ff_only_fails:
                 return SimpleNamespace(
@@ -568,22 +571,24 @@ def _make_update_side_effect(
     return side_effect, recorded
 
 
-def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
-    """When --ff-only fails (diverged history), update resets to origin/{branch}."""
+def test_cmd_update_never_resets_when_ff_only_fails(monkeypatch, tmp_path, capsys):
+    """A late ff-only failure must preserve the checkout and fail closed."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
     side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(SimpleNamespace())
+    assert exc_info.value.code == 1
 
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
-    assert len(reset_calls) == 1
-    assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
+    assert reset_calls == []
 
     out = capsys.readouterr().out
-    assert "Fast-forward not possible" in out
+    assert "checkout was not reset" in out
+    assert "Local commits are preserved" in out
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
@@ -598,6 +603,28 @@ def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
 
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 0
+
+
+def test_gateway_update_refuses_ahead_history_before_mutation(
+    monkeypatch, tmp_path, capsys
+):
+    """Noninteractive updates surface safe recovery guidance and stop early."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    side_effect, recorded = _make_update_side_effect(
+        ahead_count="2", commit_count="0"
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(SimpleNamespace(gateway=True))
+
+    assert exc_info.value.code == 1
+    assert not any("stash" in command for command in recorded)
+    assert not any("pull" in command for command in recorded)
+    out = capsys.readouterr().out
+    assert "2 commit(s) ahead" in out
+    assert "No commits or files were changed" in out
+    assert "git log --oneline --left-right" in out
 
 
 # ---------------------------------------------------------------------------

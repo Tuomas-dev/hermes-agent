@@ -22,12 +22,15 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 
         # git rev-parse --verify origin/{branch}  (check remote branch exists)
         if "rev-parse" in joined and "--verify" in joined:
-            rc = 0 if verify_ok else 128
+            # The update now separately verifies the local target branch before
+            # comparing histories. ``verify_ok`` models only the historical
+            # remote-branch probe used by these fallback tests.
+            rc = 0 if "refs/heads/" in joined or verify_ok else 128
             return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
 
         # git rev-list HEAD..origin/{branch} --count
         if "rev-list" in joined:
-            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"0\t{commit_count}\n", stderr="")
 
         # Fallback: return a successful CompletedProcess with empty stdout
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -756,7 +759,7 @@ class TestCmdUpdateBranchFlag:
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "rev-list" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"0\t{commit_count}\n", stderr="")
 
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -879,6 +882,7 @@ class TestCmdUpdateCheckBranchFlag:
         target_branch: str,
         *,
         verify_ok: bool = True,
+        ahead_count: str = "0",
         commit_count: str = "0",
         upstream_fetch_ok: bool = True,
     ):
@@ -909,7 +913,9 @@ class TestCmdUpdateCheckBranchFlag:
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
 
             if "rev-list" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{ahead_count}\t{commit_count}\n", stderr=""
+                )
 
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -968,6 +974,33 @@ class TestCmdUpdateCheckBranchFlag:
         # rev-list must never have been called once verify failed.
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         assert not any("rev-list" in c for c in commands), commands
+
+    @pytest.mark.parametrize(
+        ("ahead_count", "behind_count", "expected"),
+        [("2", "0", "2 commits ahead"), ("2", "3", "diverged")],
+    )
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
+    def test_check_reports_local_history_instead_of_up_to_date(
+        self,
+        mock_run,
+        _mock_method,
+        capsys,
+        ahead_count,
+        behind_count,
+        expected,
+    ):
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="main",
+            ahead_count=ahead_count,
+            commit_count=behind_count,
+        )
+
+        cmd_update(SimpleNamespace(check=True))
+
+        out = capsys.readouterr().out
+        assert expected in out
+        assert "Already up to date" not in out
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
