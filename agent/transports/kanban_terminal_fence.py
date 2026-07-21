@@ -1,67 +1,90 @@
-"""Task-scoped lifecycle fence shared by Codex and its Hermes MCP child."""
+"""Trusted, board-backed lifecycle fence for Codex Kanban workers."""
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
+import sqlite3
 from typing import Any, Optional
 
 
+# Retained as an import-compatible constant for older callers. It is not
+# exported to the worker process: a worker-writable pathname is not authority.
 KANBAN_TERMINAL_FENCE_ENV = "HERMES_KANBAN_TERMINAL_FENCE"
 TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 
 def publish_terminal_callback(tool_name: str, result: str) -> bool:
-    """Publish a successful terminal callback for the owning app-server.
-
-    The callback has already committed task/run state before this function is
-    called.  Errors deliberately do not publish: Codex must remain alive so it
-    can correct the call and retry.
-    """
-    path = os.environ.get(KANBAN_TERMINAL_FENCE_ENV)
-    task_id = os.environ.get("HERMES_KANBAN_TASK")
-    if not path or not task_id or tool_name not in TERMINAL_KANBAN_TOOLS:
-        return False
-    try:
-        payload = json.loads(result)
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        return False
-
-    marker = {
-        "tool": tool_name,
-        "task_id": task_id,
-        "run_id": payload.get("run_id"),
-        "status": payload.get("status"),
-    }
-    marker_path = Path(path)
-    tmp_path = marker_path.with_name(f".{marker_path.name}.{os.getpid()}.tmp")
-    try:
-        tmp_path.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
-        os.replace(tmp_path, marker_path)
-    except OSError:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
-    return True
+    """Deprecated worker-side publisher; terminal authority lives in SQLite."""
+    return False
 
 
 def read_terminal_callback(path: Optional[str]) -> Optional[dict[str, Any]]:
-    """Read a valid terminal marker, returning ``None`` until it exists."""
-    if not path:
+    """Deprecated marker reader; worker-created files are never trusted."""
+    return None
+
+
+def read_authoritative_terminal_callback(
+    db_path: Optional[str],
+    task_id: Optional[str],
+    tool_name: str,
+    run_id: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Return terminal state only when committed board rows prove this callback.
+
+    The app-server parent calls this only for a completed Hermes MCP invocation.
+    The query binds the expected task and current run to the same ended run and
+    terminal event. A read-only connection observes committed transactions only.
+    """
+    if (
+        not db_path
+        or not task_id
+        or not run_id
+        or tool_name not in TERMINAL_KANBAN_TOOLS
+    ):
         return None
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        expected_run_id = int(run_id)
+    except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict):
+
+    if tool_name == "kanban_complete":
+        expected_outcome = "completed"
+        expected_events = ("completed",)
+    else:
+        expected_outcome = "blocked"
+        expected_events = ("blocked", "dependency_wait", "block_loop_detected")
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(
+            f"file:{os.path.abspath(db_path)}?mode=ro", uri=True
+        )
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" for _ in expected_events)
+        row = conn.execute(
+            "SELECT e.run_id, e.kind, r.ended_at, r.outcome "
+            "FROM task_runs r "
+            "JOIN task_events e ON e.task_id=r.task_id AND e.run_id=r.id "
+            f"WHERE r.task_id=? AND r.id=? AND e.kind IN ({placeholders}) "
+            "ORDER BY e.id DESC LIMIT 1",
+            (task_id, expected_run_id, *expected_events),
+        ).fetchone()
+    except (OSError, sqlite3.Error):
         return None
-    if payload.get("tool") not in TERMINAL_KANBAN_TOOLS:
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if (
+        row is None
+        or row["ended_at"] is None
+        or int(row["run_id"]) != expected_run_id
+        or row["outcome"] != expected_outcome
+    ):
         return None
-    if not payload.get("task_id"):
-        return None
-    return payload
+    return {
+        "tool": tool_name,
+        "task_id": task_id,
+        "run_id": expected_run_id,
+        "status": row["kind"],
+    }

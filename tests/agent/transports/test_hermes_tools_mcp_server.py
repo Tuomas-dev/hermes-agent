@@ -205,7 +205,7 @@ class TestModuleSurface:
 
 
 class TestTerminalFencePublishing:
-    def test_successful_terminal_callback_publishes_authoritative_handoff(
+    def test_worker_cannot_publish_a_terminal_handoff(
         self, monkeypatch, tmp_path
     ):
         marker = tmp_path / "terminal.json"
@@ -221,12 +221,7 @@ class TestTerminalFencePublishing:
         )
 
         assert json.loads(result)["ok"] is True
-        assert json.loads(marker.read_text()) == {
-            "run_id": 17,
-            "status": None,
-            "task_id": "t_worker",
-            "tool": "kanban_complete",
-        }
+        assert not marker.exists()
 
     def test_failed_terminal_callback_does_not_publish(self, monkeypatch, tmp_path):
         marker = tmp_path / "terminal.json"

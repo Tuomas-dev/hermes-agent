@@ -152,15 +152,8 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 def _dispatch_with_terminal_fence(
     dispatch: Any, tool_name: str, args: dict[str, Any]
 ) -> str:
-    """Dispatch one MCP tool and publish successful terminal handoffs."""
-    result = dispatch(tool_name, args)
-    if tool_name in {"kanban_complete", "kanban_block"}:
-        from agent.transports.kanban_terminal_fence import (
-            publish_terminal_callback,
-        )
-
-        publish_terminal_callback(tool_name, result)
-    return result
+    """Dispatch one MCP tool; committed board state is terminal authority."""
+    return dispatch(tool_name, args)
 
 
 def _build_server() -> Any:
